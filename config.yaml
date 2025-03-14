@@ -1,0 +1,27 @@
+# SBOM生成器配置文件
+
+# GitHub配置
+github_token: ""  # 在这里设置你的GitHub令牌
+
+# SBOM配置
+namespace_prefix: "https://spdx.org/spdxdocs"
+creator_name: "SBOM Generator"
+creator_email: "sbom-generator@example.com"
+
+# 日志配置
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# 输出配置
+output_dir: "output"
+output_format: "json"  # json, tag-value
+
+# API rate limit handling
+rate_limit_wait: true  # Wait when rate limit is reached
+
+# Temporary Files
+temp:
+  # Directory for temporary files (relative to project root)
+  directory: "Temp"
+  
+  # Clean temporary files after execution
+  cleanup_after: true 
