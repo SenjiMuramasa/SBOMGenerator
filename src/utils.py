@@ -175,12 +175,30 @@ def get_package_manager_files(repo_dir):
     # 查找匹配的文件
     package_manager_files = []
     
-    for root, _, files in os.walk(repo_dir):
-        for file in files:
-            file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, repo_dir)
+    try:
+        for root, dirs, files in os.walk(repo_dir):
+            # 跳过某些目录
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'node_modules' and d != '__pycache__']
             
-            for manager, pattern in package_manager_patterns:
-                if pattern.search(file):
-                    package_manager_files.append((manager, rel_path))
-                    break 
+            for file in files:
+                try:
+                    file_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(file_path, repo_dir)
+                    
+                    # 跳过太大的文件
+                    try:
+                        if os.path.getsize(file_path) > 10 * 1024 * 1024:  # 10MB
+                            continue
+                    except:
+                        continue
+                    
+                    for manager, pattern in package_manager_patterns:
+                        if pattern.search(file):
+                            package_manager_files.append((manager, rel_path))
+                            break
+                except Exception as e:
+                    logger.warning(f"处理文件 {file} 时出错: {e}")
+    except Exception as e:
+        logger.error(f"遍历仓库目录 {repo_dir} 时出错: {e}")
+    
+    return package_manager_files 

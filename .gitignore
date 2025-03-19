@@ -45,3 +45,4 @@ Temp/
 # SBOM output files
 *-sbom.spdx.json
 *-sbom.spdx 
+/output

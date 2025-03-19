@@ -11,15 +11,27 @@ import re
 from datetime import datetime
 import shutil
 from tqdm import tqdm
-
+import yaml
 from src.utils import (
     clean_temp_directory, 
     create_repo_temp_dir, 
     detect_programming_languages,
-    get_package_manager_files
+    get_package_manager_files,
+    ensure_temp_directory,
+    get_timestamp
 )
 
 logger = logging.getLogger(__name__)
+
+def import_helper(module_name):
+    """尝试导入可选模块，如果不存在则返回 None"""
+    try:
+        return __import__(module_name)
+    except ImportError:
+        return None
+
+# 导入可选的依赖解析模块
+toml = import_helper('toml')
 
 class SimpleSBOMGenerator:
     """简化版 SBOM 生成器，生成 SPDX-2.3 格式的 SBOM"""
@@ -326,29 +338,71 @@ class SimpleSBOMGenerator:
         dependencies = []
         
         try:
+            # 先检查文件是否为空
+            if os.path.getsize(file_path) == 0:
+                logger.warning(f"package.json 文件 {file_path} 为空")
+                return dependencies
+                
             with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+                content = f.read()
+            
+            # 规范化处理 JSON 内容
+            # 1. 移除注释 (JSON 标准不支持注释，但有些项目会添加)
+            content = self._normalize_json(content)
                 
-                # 处理依赖项
-                dep_sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"解析 package.json 文件 {file_path} 时出错: {e}")
+                return dependencies
                 
-                for section in dep_sections:
-                    if section in data:
-                        for name, version in data[section].items():
-                            dependencies.append({
-                                "name": name,
-                                "SPDXID": f"SPDXRef-Package-{name}",
-                                "versionInfo": version,
-                                "downloadLocation": f"https://www.npmjs.com/package/{name}",
-                                "licenseConcluded": "NOASSERTION",
-                                "licenseDeclared": "NOASSERTION",
-                                "copyrightText": "NOASSERTION",
-                                "supplier": "Organization: npm"
-                            })
+            # 处理依赖项
+            dep_sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+            
+            for section in dep_sections:
+                if section in data and isinstance(data[section], dict):
+                    for name, version in data[section].items():
+                        if not isinstance(name, str) or not name:
+                            continue
+                            
+                        if not isinstance(version, str):
+                            version = str(version)
+                            
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{name}",
+                            "versionInfo": version,
+                            "downloadLocation": f"https://www.npmjs.com/package/{name}",
+                            "licenseConcluded": "NOASSERTION",
+                            "licenseDeclared": "NOASSERTION",
+                            "copyrightText": "NOASSERTION",
+                            "supplier": "Organization: npm"
+                        })
         except Exception as e:
             logger.warning(f"解析 package.json 文件 {file_path} 时出错: {e}")
         
         return dependencies
+    
+    def _normalize_json(self, content):
+        """
+        规范化 JSON 内容，移除注释和处理其他非标准JSON格式
+        
+        Args:
+            content (str): JSON 内容
+            
+        Returns:
+            str: 规范化后的 JSON 内容
+        """
+        # 移除单行注释 (//...)
+        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+        
+        # 移除多行注释 (/* ... */)
+        content = re.sub(r'/\*[\s\S]*?\*/', '', content)
+        
+        # 移除尾随逗号，这在标准JSON中是不允许的，但在一些项目中使用
+        content = re.sub(r',\s*([}\]])', r'\1', content)
+        
+        return content
     
     def _parse_go_mod(self, file_path):
         """解析 go.mod 文件"""
@@ -356,29 +410,58 @@ class SimpleSBOMGenerator:
         
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('require ('):
-                        continue
-                    if line.startswith(')'):
-                        break
+                content = f.read()
+                
+                # 规范化处理文件内容，删除注释
+                content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+                
+                # 处理多行 require 块，匹配整个块包括括号
+                require_block_matches = re.finditer(r'require\s*\(\s*([\s\S]*?)\s*\)', content)
+                for block_match in require_block_matches:
+                    # 提取块内容（不包括require和括号）
+                    block_content = block_match.group(1).strip()
                     
-                    # 匹配：依赖项路径 版本
-                    match = re.match(r'^\s*([^\s]+)\s+([^\s]+)', line)
-                    if match:
-                        name = match.group(1)
-                        version = match.group(2)
+                    # 按行处理每个依赖项
+                    for line in block_content.split('\n'):
+                        line = line.strip()
+                        if not line or line.startswith('//'):
+                            continue
                         
-                        dependencies.append({
-                            "name": name,
-                            "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
-                            "versionInfo": version,
-                            "downloadLocation": f"https://pkg.go.dev/{name}",
-                            "licenseConcluded": "NOASSERTION",
-                            "licenseDeclared": "NOASSERTION",
-                            "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: Go Module"
-                        })
+                        # 匹配依赖项路径和版本
+                        # 格式应该是: module_path version [// comment]
+                        match = re.match(r'([^\s]+)\s+([^\s/]+)(?:\s*//.*)?$', line)
+                        if match:
+                            name = match.group(1)
+                            version = match.group(2)
+                            
+                            dependencies.append({
+                                "name": name,
+                                "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
+                                "versionInfo": version,
+                                "downloadLocation": f"https://pkg.go.dev/{name}",
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: Go Module"
+                            })
+                
+                # 处理单行 require 语句
+                # 格式是: require module_path version
+                single_requires = re.finditer(r'require\s+([^\s\(]+)\s+([^\s\(]+)', content)
+                for req in single_requires:
+                    name = req.group(1)
+                    version = req.group(2)
+                    
+                    dependencies.append({
+                        "name": name,
+                        "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://pkg.go.dev/{name}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: Go Module"
+                    })
         except Exception as e:
             logger.warning(f"解析 go.mod 文件 {file_path} 时出错: {e}")
         
@@ -465,9 +548,70 @@ class SimpleSBOMGenerator:
     def _parse_pyproject_toml(self, file_path):
         """简化版 pyproject.toml 解析"""
         dependencies = []
-        in_dependencies_section = False
         
         try:
+            # 使用 toml 库解析
+            if toml:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = toml.load(f)
+                    
+                    # 处理 poetry 依赖
+                    if 'tool' in data and 'poetry' in data['tool'] and 'dependencies' in data['tool']['poetry']:
+                        for name, version_info in data['tool']['poetry']['dependencies'].items():
+                            if name == 'python':  # 跳过 python 解释器版本
+                                continue
+                                
+                            # 处理不同格式的版本信息
+                            if isinstance(version_info, str):
+                                version = version_info
+                            elif isinstance(version_info, dict) and 'version' in version_info:
+                                version = version_info['version']
+                            else:
+                                version = "NOASSERTION"
+                            
+                            dependencies.append({
+                                "name": name,
+                                "SPDXID": f"SPDXRef-Package-{name}",
+                                "versionInfo": version,
+                                "downloadLocation": f"https://pypi.org/project/{name}/",
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: PyPI"
+                            })
+                    
+                    # 处理 PEP 621 项目依赖
+                    if 'project' in data and 'dependencies' in data['project']:
+                        for dep in data['project']['dependencies']:
+                            # 处理 PEP 508 格式的依赖说明
+                            parts = re.split(r'[<>=~]', dep, 1)
+                            package_name = parts[0].strip()
+                            
+                            if len(parts) > 1:
+                                version = dep[len(package_name):].strip()
+                            else:
+                                version = "NOASSERTION"
+                                
+                            dependencies.append({
+                                "name": package_name,
+                                "SPDXID": f"SPDXRef-Package-{package_name}",
+                                "versionInfo": version,
+                                "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: PyPI"
+                            })
+                    
+                    return dependencies
+                except Exception as e:
+                    logger.warning(f"使用 toml 库解析 {file_path} 时出错: {e}，将尝试简单解析方式")
+            else:
+                logger.warning("未安装 toml 库，将使用简单方式解析 pyproject.toml 文件")
+            
+            # 简单的行解析方式（作为备选方案）
+            in_dependencies_section = False
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
@@ -482,6 +626,10 @@ class SimpleSBOMGenerator:
                     if in_dependencies_section and '=' in line:
                         parts = line.split('=', 1)
                         package_name = parts[0].strip().strip('"\'')
+                        
+                        if package_name == 'python':  # 跳过 python 解释器版本
+                            continue
+                            
                         version = parts[1].strip().strip('"\'')
                         
                         dependencies.append({
@@ -494,6 +642,7 @@ class SimpleSBOMGenerator:
                             "copyrightText": "NOASSERTION",
                             "supplier": "Organization: PyPI"
                         })
+                        
         except Exception as e:
             logger.warning(f"解析 pyproject.toml 文件 {file_path} 时出错: {e}")
         
@@ -507,36 +656,74 @@ class SimpleSBOMGenerator:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-                # 查找所有 dependency 元素
-                for dep_match in re.finditer(r'<dependency>(.*?)</dependency>', content, re.DOTALL):
-                    dep_content = dep_match.group(1)
+            if not content.strip():
+                logger.warning(f"pom.xml 文件 {file_path} 为空")
+                return dependencies
+            
+            # 规范化XML内容
+            content = self._normalize_xml(content)
+            
+            # 先用正则表达式检查文件是否合法
+            if not re.search(r'<project', content):
+                logger.warning(f"pom.xml 文件 {file_path} 不包含 project 元素")
+                return dependencies
+            
+            # 查找所有 dependency 元素，支持不同的格式
+            # 1. <dependency>...</dependency> 格式
+            for dep_match in re.finditer(r'<dependency[^>]*>(.*?)</dependency>', content, re.DOTALL):
+                dep_content = dep_match.group(1)
+                
+                # 提取 groupId, artifactId 和 version
+                group_id = re.search(r'<groupId[^>]*>(.*?)</groupId>', dep_content)
+                artifact_id = re.search(r'<artifactId[^>]*>(.*?)</artifactId>', dep_content)
+                version = re.search(r'<version[^>]*>(.*?)</version>', dep_content)
+                
+                if group_id and artifact_id:
+                    group_id = group_id.group(1).strip()
+                    artifact_id = artifact_id.group(1).strip()
+                    version_str = version.group(1).strip() if version else "NOASSERTION"
                     
-                    # 提取 groupId, artifactId 和 version
-                    group_id = re.search(r'<groupId>(.*?)</groupId>', dep_content)
-                    artifact_id = re.search(r'<artifactId>(.*?)</artifactId>', dep_content)
-                    version = re.search(r'<version>(.*?)</version>', dep_content)
+                    package_name = f"{group_id}:{artifact_id}"
                     
-                    if group_id and artifact_id:
-                        group_id = group_id.group(1)
-                        artifact_id = artifact_id.group(1)
-                        version_str = version.group(1) if version else "NOASSERTION"
-                        
-                        package_name = f"{group_id}:{artifact_id}"
-                        
-                        dependencies.append({
-                            "name": package_name,
-                            "SPDXID": f"SPDXRef-Package-{hashlib.md5(package_name.encode()).hexdigest()}",
-                            "versionInfo": version_str,
-                            "downloadLocation": f"https://mvnrepository.com/artifact/{group_id}/{artifact_id}",
-                            "licenseConcluded": "NOASSERTION",
-                            "licenseDeclared": "NOASSERTION",
-                            "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: Maven Central"
-                        })
+                    dependencies.append({
+                        "name": package_name,
+                        "SPDXID": f"SPDXRef-Package-{hashlib.md5(package_name.encode()).hexdigest()}",
+                        "versionInfo": version_str,
+                        "downloadLocation": f"https://mvnrepository.com/artifact/{group_id}/{artifact_id}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: Maven Central"
+                    })
         except Exception as e:
             logger.warning(f"解析 pom.xml 文件 {file_path} 时出错: {e}")
         
         return dependencies
+
+    def _normalize_xml(self, content):
+        """
+        规范化 XML 内容
+        
+        Args:
+            content (str): XML 内容
+            
+        Returns:
+            str: 规范化后的 XML 内容
+        """
+        # 移除XML注释
+        content = re.sub(r'<!--[\s\S]*?-->', '', content)
+        
+        # 规范化空白字符 - 减少多个连续空格/换行为单个空格
+        content = re.sub(r'\s+', ' ', content)
+        
+        # 恢复XML标签格式 - 在尖括号后添加适当的空格
+        content = re.sub(r'<\s+', '<', content)
+        content = re.sub(r'\s+>', '>', content)
+        
+        # 恢复结束标签 - 确保结束标签格式正确
+        content = re.sub(r'<\s*/\s*', '</', content)
+        
+        return content
     
     def _parse_gradle(self, file_path):
         """解析 Gradle 构建文件（简化版本）"""
@@ -545,34 +732,115 @@ class SimpleSBOMGenerator:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
+            
+            # 规范化Gradle构建文件内容
+            content = self._normalize_gradle(content)
+            
+            # 查找依赖项声明
+            # 支持多种常见的依赖声明格式:
+            # 1. implementation 'group:name:version'
+            # 2. api "group:name:version"
+            # 3. implementation(group: 'org.example', name: 'lib', version: '1.0')
+            # 4. implementation group: 'org.example', name: 'lib', version: '1.0'
+            
+            # 处理单引号或双引号包围的简单格式
+            for match in re.finditer(r'(implementation|api|compileOnly|runtimeOnly|testImplementation)\s*[\'\"]([^\'"]+)[\'"]', content):
+                dep_str = match.group(2)
                 
-                # 查找依赖项声明（这是一个简化的方法，实际的 Gradle 文件可能更复杂）
-                for match in re.finditer(r'(implementation|api|compileOnly|runtimeOnly|testImplementation)\s*[\'\"]([^\'"]+)[\'"]', content):
-                    dep_str = match.group(2)
+                # 尝试解析 'group:name:version' 格式
+                parts = dep_str.split(':')
+                if len(parts) >= 2:
+                    group_id = parts[0]
+                    artifact_id = parts[1]
+                    version = parts[2] if len(parts) > 2 else "NOASSERTION"
                     
-                    # 尝试解析 'group:name:version' 格式
-                    parts = dep_str.split(':')
-                    if len(parts) >= 2:
-                        group_id = parts[0]
-                        artifact_id = parts[1]
-                        version = parts[2] if len(parts) > 2 else "NOASSERTION"
-                        
-                        package_name = f"{group_id}:{artifact_id}"
-                        
-                        dependencies.append({
-                            "name": package_name,
-                            "SPDXID": f"SPDXRef-Package-{hashlib.md5(package_name.encode()).hexdigest()}",
-                            "versionInfo": version,
-                            "downloadLocation": f"https://mvnrepository.com/artifact/{group_id}/{artifact_id}",
-                            "licenseConcluded": "NOASSERTION",
-                            "licenseDeclared": "NOASSERTION",
-                            "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: Maven Central"
-                        })
+                    package_name = f"{group_id}:{artifact_id}"
+                    
+                    dependencies.append({
+                        "name": package_name,
+                        "SPDXID": f"SPDXRef-Package-{hashlib.md5(package_name.encode()).hexdigest()}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://mvnrepository.com/artifact/{group_id}/{artifact_id}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: Maven Central"
+                    })
+            
+            # 处理 Map 形式声明 (处理括号和不带括号的两种情况)
+            map_patterns = [
+                # 带括号版本: implementation(group: 'org.example', name: 'lib', version: '1.0')
+                r'(implementation|api|compileOnly|runtimeOnly|testImplementation)\s*\(\s*group\s*:\s*[\'"]([^\'"]+)[\'"]\s*,\s*name\s*:\s*[\'"]([^\'"]+)[\'"]\s*(?:,\s*version\s*:\s*[\'"]([^\'"]+)[\'"]\s*)?',
+                # 不带括号版本: implementation group: 'org.example', name: 'lib', version: '1.0'
+                r'(implementation|api|compileOnly|runtimeOnly|testImplementation)\s+group\s*:\s*[\'"]([^\'"]+)[\'"]\s*,\s*name\s*:\s*[\'"]([^\'"]+)[\'"]\s*(?:,\s*version\s*:\s*[\'"]([^\'"]+)[\'"]\s*)?'
+            ]
+            
+            for pattern in map_patterns:
+                for match in re.finditer(pattern, content):
+                    group_id = match.group(2)
+                    artifact_id = match.group(3)
+                    version = match.group(4) if match.group(4) else "NOASSERTION"
+                    
+                    package_name = f"{group_id}:{artifact_id}"
+                    
+                    dependencies.append({
+                        "name": package_name,
+                        "SPDXID": f"SPDXRef-Package-{hashlib.md5(package_name.encode()).hexdigest()}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://mvnrepository.com/artifact/{group_id}/{artifact_id}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: Maven Central"
+                    })
+                    
         except Exception as e:
             logger.warning(f"解析 Gradle 文件 {file_path} 时出错: {e}")
         
         return dependencies
+        
+    def _normalize_gradle(self, content):
+        """
+        规范化 Gradle 构建文件内容
+        
+        Args:
+            content (str): Gradle 文件内容
+            
+        Returns:
+            str: 规范化后的内容
+        """
+        # 移除单行注释
+        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
+        
+        # 移除多行注释
+        content = re.sub(r'/\*[\s\S]*?\*/', '', content)
+        
+        # 规范化字符串文字内部的空白
+        # 将多行字符串变为单行以便更好地匹配
+        def replace_multiline_string(match):
+            s = match.group(1)
+            s = re.sub(r'\s+', ' ', s)
+            return f"'''{s}'''"
+        
+        # 处理三单引号字符串
+        content = re.sub(r"'''([\s\S]+?)'''", replace_multiline_string, content)
+        
+        # 处理三双引号字符串
+        content = re.sub(r'"""([\s\S]+?)"""', lambda m: '"""' + re.sub(r'\s+', ' ', m.group(1)) + '"""', content)
+        
+        # 格式化"implementation("等后面的内容，使它们在一行内
+        # 这有助于正则表达式匹配
+        def format_dependency_statement(match):
+            stmt = match.group(1)
+            content = match.group(2)
+            # 移除内容中的换行和多余空格
+            content = re.sub(r'\s+', ' ', content)
+            return f"{stmt}({content})"
+        
+        content = re.sub(r'(implementation|api|compileOnly|runtimeOnly|testImplementation)\s*\(([\s\S]*?)\)', 
+                        format_dependency_statement, content)
+        
+        return content
     
     def _write_sbom(self, sbom_document, output_file):
         """写入 SBOM 到文件"""
