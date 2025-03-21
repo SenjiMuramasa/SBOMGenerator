@@ -11,6 +11,8 @@ from pathlib import Path
 import sys
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 def setup_logging(log_level='INFO'):
     """
     设置日志

@@ -336,48 +336,55 @@ class SimpleSBOMGenerator:
     def _parse_package_json(self, file_path):
         """解析 package.json 文件"""
         dependencies = []
-        
         try:
-            # 先检查文件是否为空
-            if os.path.getsize(file_path) == 0:
-                logger.warning(f"package.json 文件 {file_path} 为空")
-                return dependencies
-                
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            
-            # 规范化处理 JSON 内容
-            # 1. 移除注释 (JSON 标准不支持注释，但有些项目会添加)
-            content = self._normalize_json(content)
-                
-            try:
+                content = self._normalize_json(content)
                 data = json.loads(content)
-            except json.JSONDecodeError as e:
-                logger.warning(f"解析 package.json 文件 {file_path} 时出错: {e}")
-                return dependencies
                 
-            # 处理依赖项
-            dep_sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
-            
-            for section in dep_sections:
-                if section in data and isinstance(data[section], dict):
-                    for name, version in data[section].items():
-                        if not isinstance(name, str) or not name:
-                            continue
-                            
-                        if not isinstance(version, str):
-                            version = str(version)
-                            
-                        dependencies.append({
-                            "name": name,
-                            "SPDXID": f"SPDXRef-Package-{name}",
-                            "versionInfo": version,
-                            "downloadLocation": f"https://www.npmjs.com/package/{name}",
-                            "licenseConcluded": "NOASSERTION",
-                            "licenseDeclared": "NOASSERTION",
-                            "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: npm"
-                        })
+                # 获取主包的许可证信息
+                license_info = data.get('license', {})
+                if isinstance(license_info, str):
+                    license_declared = license_info
+                elif isinstance(license_info, dict):
+                    license_declared = license_info.get('type', 'NOASSERTION')
+                else:
+                    license_declared = 'NOASSERTION'
+                
+                # 获取版权信息
+                copyright_text = data.get('copyright', 'NOASSERTION')
+                
+                # 获取作者信息
+                author_info = data.get('author', {})
+                if isinstance(author_info, str):
+                    supplier = f"Person: {author_info}"
+                elif isinstance(author_info, dict):
+                    supplier = f"Person: {author_info.get('name', 'NOASSERTION')}"
+                else:
+                    supplier = "Organization: npm"
+                
+                # 解析依赖项
+                dep_sections = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']
+                
+                for section in dep_sections:
+                    if section in data and isinstance(data[section], dict):
+                        for name, version in data[section].items():
+                            if not isinstance(name, str) or not name:
+                                continue
+                                
+                            if not isinstance(version, str):
+                                version = str(version)
+                                
+                            dependencies.append({
+                                "name": name,
+                                "SPDXID": f"SPDXRef-Package-{name}",
+                                "versionInfo": version,
+                                "downloadLocation": f"https://www.npmjs.com/package/{name}",
+                                "licenseConcluded": license_declared,
+                                "licenseDeclared": license_declared,
+                                "copyrightText": copyright_text,
+                                "supplier": supplier
+                            })
         except Exception as e:
             logger.warning(f"解析 package.json 文件 {file_path} 时出错: {e}")
         
@@ -407,61 +414,80 @@ class SimpleSBOMGenerator:
     def _parse_go_mod(self, file_path):
         """解析 go.mod 文件"""
         dependencies = []
-        
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-                # 规范化处理文件内容，删除注释
-                content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-                
-                # 处理多行 require 块，匹配整个块包括括号
-                require_block_matches = re.finditer(r'require\s*\(\s*([\s\S]*?)\s*\)', content)
-                for block_match in require_block_matches:
-                    # 提取块内容（不包括require和括号）
-                    block_content = block_match.group(1).strip()
+                # 获取模块信息
+                module_match = re.search(r'module\s+([^\s]+)', content)
+                if module_match:
+                    module_name = module_match.group(1)
                     
-                    # 按行处理每个依赖项
-                    for line in block_content.split('\n'):
-                        line = line.strip()
-                        if not line or line.startswith('//'):
-                            continue
+                    # 尝试从 LICENSE 文件获取许可证信息
+                    license_file = os.path.join(os.path.dirname(file_path), 'LICENSE')
+                    license_declared = 'NOASSERTION'
+                    copyright_text = 'NOASSERTION'
+                    
+                    if os.path.exists(license_file):
+                        try:
+                            with open(license_file, 'r', encoding='utf-8') as lf:
+                                license_content = lf.read()
+                                # 尝试从许可证文件内容中提取版权信息
+                                copyright_match = re.search(r'Copyright\s+\([cC]\)\s+(\d{4}(-\d{4})?\s+[^\.]+)', license_content)
+                                if copyright_match:
+                                    copyright_text = copyright_match.group(1)
+                                
+                                # 尝试识别许可证类型
+                                if 'MIT License' in license_content:
+                                    license_declared = 'MIT'
+                                elif 'Apache License' in license_content:
+                                    license_declared = 'Apache-2.0'
+                                elif 'GNU General Public License' in license_content:
+                                    license_declared = 'GPL-3.0-or-later'
+                        except Exception as e:
+                            logger.warning(f"读取 LICENSE 文件时出错: {e}")
+                    
+                    # 解析 require 语句
+                    require_blocks = re.finditer(r'require\s*\(([\s\S]*?)\)', content)
+                    for block in require_blocks:
+                        block_content = block.group(1)
+                        # 处理多行 require 块
+                        for line in block_content.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith('//'):
+                                continue
+                            req_match = re.match(r'([^\s]+)\s+([^\s]+)', line)
+                            if req_match:
+                                name = req_match.group(1)
+                                version = req_match.group(2)
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://pkg.go.dev/{name}",
+                                    "licenseConcluded": license_declared,
+                                    "licenseDeclared": license_declared,
+                                    "copyrightText": copyright_text,
+                                    "supplier": f"Organization: {module_name.split('/')[0]}"
+                                })
+                    
+                    # 解析单行 require 语句
+                    single_requires = re.finditer(r'require\s+([^\s]+)\s+([^\s]+)', content)
+                    for req in single_requires:
+                        name = req.group(1)
+                        version = req.group(2)
                         
-                        # 匹配依赖项路径和版本
-                        # 格式应该是: module_path version [// comment]
-                        match = re.match(r'([^\s]+)\s+([^\s/]+)(?:\s*//.*)?$', line)
-                        if match:
-                            name = match.group(1)
-                            version = match.group(2)
-                            
-                            dependencies.append({
-                                "name": name,
-                                "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
-                                "versionInfo": version,
-                                "downloadLocation": f"https://pkg.go.dev/{name}",
-                                "licenseConcluded": "NOASSERTION",
-                                "licenseDeclared": "NOASSERTION",
-                                "copyrightText": "NOASSERTION",
-                                "supplier": "Organization: Go Module"
-                            })
-                
-                # 处理单行 require 语句
-                # 格式是: require module_path version
-                single_requires = re.finditer(r'require\s+([^\s\(]+)\s+([^\s\(]+)', content)
-                for req in single_requires:
-                    name = req.group(1)
-                    version = req.group(2)
-                    
-                    dependencies.append({
-                        "name": name,
-                        "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
-                        "versionInfo": version,
-                        "downloadLocation": f"https://pkg.go.dev/{name}",
-                        "licenseConcluded": "NOASSERTION",
-                        "licenseDeclared": "NOASSERTION",
-                        "copyrightText": "NOASSERTION",
-                        "supplier": "Organization: Go Module"
-                    })
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{hashlib.md5(name.encode()).hexdigest()}",
+                            "versionInfo": version,
+                            "downloadLocation": f"https://pkg.go.dev/{name}",
+                            "licenseConcluded": license_declared,
+                            "licenseDeclared": license_declared,
+                            "copyrightText": copyright_text,
+                            "supplier": f"Organization: {module_name.split('/')[0]}"
+                        })
         except Exception as e:
             logger.warning(f"解析 go.mod 文件 {file_path} 时出错: {e}")
         
