@@ -190,10 +190,12 @@ class SimpleSBOMGenerator:
                     package['downloadLocation'] = info['package_url']
                 
                 # 更新供应商信息
-                if 'author' in info:
+                if 'author' in info and info['author'] and info['author'].lower() != 'none':
                     package['supplier'] = f"Person: {info['author']}"
-                elif 'maintainer' in info:
+                elif 'maintainer' in info and info['maintainer'] and info['maintainer'].lower() != 'none':
                     package['supplier'] = f"Person: {info['maintainer']}"
+                else:
+                    package['supplier'] = "Organization: PyPI"
             
             return package
         
