@@ -169,9 +169,27 @@ class SimpleSBOMGenerator:
                 info = pypi_info['info']
                 
                 # 更新许可证信息
-                if 'license' in info:
-                    package['licenseDeclared'] = info['license']
-                    package['licenseConcluded'] = info['license']
+                license_info = None
+                
+                # 1. 首先尝试从 classifiers 中获取许可证信息
+                if 'classifiers' in info:
+                    license_classifiers = [c for c in info['classifiers'] if c.startswith('License :: ')]
+                    if license_classifiers:
+                        # 获取最后一个许可证分类器（通常是最具体的）
+                        license_info = license_classifiers[-1].replace('License :: ', '')
+                
+                # 2. 如果没有从 classifiers 获取到，或者主许可证字段过长，则使用主许可证字段
+                if not license_info and 'license' in info:
+                    license_info = info['license']
+                    # 如果主许可证字段过长（超过100个字符），则使用 classifiers 中的信息
+                    if len(license_info) > 100 and 'classifiers' in info:
+                        license_classifiers = [c for c in info['classifiers'] if c.startswith('License :: ')]
+                        if license_classifiers:
+                            license_info = license_classifiers[-1].replace('License :: ', '')
+                
+                if license_info:
+                    package['licenseDeclared'] = license_info
+                    package['licenseConcluded'] = license_info
                 
                 # 更新版权信息
                 if 'author' in info:
