@@ -12,6 +12,9 @@ from datetime import datetime
 import shutil
 from tqdm import tqdm
 import yaml
+import requests
+import concurrent.futures
+from typing import Dict, List, Optional
 from src.utils import (
     clean_temp_directory, 
     create_repo_temp_dir, 
@@ -32,6 +35,31 @@ def import_helper(module_name):
 
 # 导入可选的依赖解析模块
 toml = import_helper('toml')
+
+class PyPIClient:
+    """PyPI API 客户端"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.base_url = "https://pypi.org/pypi"
+    
+    def get_package_info(self, package_name: str) -> Optional[Dict]:
+        """
+        从 PyPI 获取包信息
+        
+        Args:
+            package_name (str): 包名
+            
+        Returns:
+            Optional[Dict]: 包信息字典，如果获取失败则返回 None
+        """
+        try:
+            response = self.session.get(f"{self.base_url}/{package_name}/json")
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.warning(f"获取包 {package_name} 的 PyPI 信息时出错: {e}")
+            return None
 
 class SimpleSBOMGenerator:
     """简化版 SBOM 生成器，生成 SPDX-2.3 格式的 SBOM"""
@@ -56,6 +84,7 @@ class SimpleSBOMGenerator:
         self.creator_email = creator_email
         self.output_format = output_format
         self.repo_temp_dir = None
+        self.pypi_client = PyPIClient()
         # 设置文件扩展名过滤器 - 这些是我们感兴趣的文件类型
         self.include_extensions = [
             '.py', '.js', '.java', '.go', '.rb', '.c', '.cpp', '.h', '.cs', 
@@ -115,6 +144,74 @@ class SimpleSBOMGenerator:
             clean_temp_directory(self.repo_temp_dir)
             logger.info(f"清理临时目录: {self.repo_temp_dir}")
     
+    def _enhance_python_packages(self, packages: List[Dict], max_workers: int = 10) -> List[Dict]:
+        """
+        通过 PyPI API 增强 Python 包的信息
+        
+        Args:
+            packages (List[Dict]): 包列表
+            max_workers (int): 最大线程数
+            
+        Returns:
+            List[Dict]: 增强后的包列表
+        """
+        python_packages = [p for p in packages if p.get('supplier') == 'Organization: PyPI']
+        if not python_packages:
+            return packages
+            
+        logger.info(f"开始从 PyPI 获取 {len(python_packages)} 个包的信息...")
+        
+        def process_package(package: Dict) -> Dict:
+            package_name = package['name']
+            pypi_info = self.pypi_client.get_package_info(package_name)
+            
+            if pypi_info and 'info' in pypi_info:
+                info = pypi_info['info']
+                
+                # 更新许可证信息
+                if 'license' in info:
+                    package['licenseDeclared'] = info['license']
+                    package['licenseConcluded'] = info['license']
+                
+                # 更新版权信息
+                if 'author' in info:
+                    package['copyrightText'] = f"Copyright (c) {info['author']}"
+                
+                # 更新描述信息
+                if 'summary' in info:
+                    package['description'] = info['summary']
+                
+                # 更新主页
+                if 'home_page' in info and info['home_page']:
+                    package['homepage'] = info['home_page']
+                
+                # 更新下载位置
+                if 'package_url' in info:
+                    package['downloadLocation'] = info['package_url']
+                
+                # 更新供应商信息
+                if 'author' in info:
+                    package['supplier'] = f"Person: {info['author']}"
+                elif 'maintainer' in info:
+                    package['supplier'] = f"Person: {info['maintainer']}"
+            
+            return package
+        
+        # 使用线程池并行处理
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            enhanced_packages = list(tqdm(
+                executor.map(process_package, python_packages),
+                total=len(python_packages),
+                desc="获取 PyPI 信息"
+            ))
+        
+        # 更新原始包列表中的 Python 包信息
+        for i, package in enumerate(packages):
+            if package.get('supplier') == 'Organization: PyPI':
+                packages[i] = enhanced_packages.pop(0)
+        
+        return packages
+
     def _create_sbom_document(self, org, repo, repo_dir, metadata):
         """创建 SBOM 文档"""
         timestamp = datetime.utcnow().isoformat() + 'Z'
@@ -190,6 +287,9 @@ class SimpleSBOMGenerator:
         # 将依赖项添加到 packages 列表中
         for dep in dependencies:
             packages.append(dep)
+        
+        # 通过 PyPI API 增强 Python 包信息
+        packages = self._enhance_python_packages(packages)
         
         logger.info(f"总共收集了 {len(packages)} 个包的信息")
         
