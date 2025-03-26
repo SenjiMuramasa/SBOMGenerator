@@ -176,7 +176,7 @@ class SimpleSBOMGenerator:
                     license_classifiers = [c for c in info['classifiers'] if c.startswith('License :: ')]
                     if license_classifiers:
                         # 获取最后一个许可证分类器（通常是最具体的）
-                        license_info = license_classifiers[-1].replace('License :: ', '')
+                        license_info = license_classifiers[-1].replace('License :: OSI Approved :: ', '')
                 
                 # 2. 如果没有从 classifiers 获取到，或者主许可证字段过长，则使用主许可证字段
                 if not license_info and 'license' in info:
@@ -185,7 +185,7 @@ class SimpleSBOMGenerator:
                     if len(license_info) > 100 and 'classifiers' in info:
                         license_classifiers = [c for c in info['classifiers'] if c.startswith('License :: ')]
                         if license_classifiers:
-                            license_info = license_classifiers[-1].replace('License :: ', '')
+                            license_info = license_classifiers[-1].replace('License :: OSI Approved :: ', '')
                 
                 if license_info:
                     package['licenseDeclared'] = license_info
