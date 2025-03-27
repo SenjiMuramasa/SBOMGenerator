@@ -138,6 +138,62 @@ class SimpleSBOMGenerator:
             logger.error(f"生成 SBOM 时出错: {e}", exc_info=True)
             raise
     
+    def generate_sbom_from_local_path(self, local_path, output_file, project_name=None):
+        """
+        为本地项目目录生成 SBOM
+        
+        Args:
+            local_path (str): 本地项目目录路径
+            output_file (str): 输出文件路径
+            project_name (str, optional): 项目名称，如果不提供则使用目录名
+            
+        Returns:
+            str: 生成的 SBOM 文件路径
+        """
+        try:
+            # 检查本地路径是否存在
+            if not os.path.exists(local_path):
+                raise ValueError(f"指定的本地路径不存在: {local_path}")
+                
+            if not os.path.isdir(local_path):
+                raise ValueError(f"指定的路径不是一个目录: {local_path}")
+            
+            # 获取项目名称
+            if not project_name:
+                project_name = os.path.basename(os.path.normpath(local_path))
+            
+            logger.info(f"开始为本地项目 {project_name} 生成SBOM")
+            
+            # 创建一个简单的元数据对象
+            metadata = {
+                "name": project_name,
+                "description": f"Local project: {project_name}",
+                "license": None,
+                "clone_url": f"file://{os.path.abspath(local_path)}",
+                "html_url": f"file://{os.path.abspath(local_path)}",
+                "default_branch": "local"
+            }
+            
+            # 创建 SBOM 文档
+            sbom_document = self._create_sbom_document(
+                "local", project_name, local_path, metadata
+            )
+            logger.info("创建 SBOM 文档")
+            
+            # 确保输出目录存在
+            output_dir = os.path.dirname(os.path.abspath(output_file))
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+            
+            # 写入 SBOM 到文件
+            self._write_sbom(sbom_document, output_file)
+            logger.info(f"SBOM 已写入到 {output_file}")
+            
+            return output_file
+        except Exception as e:
+            logger.error(f"从本地路径生成 SBOM 时出错: {e}", exc_info=True)
+            raise
+    
     def cleanup(self):
         """清理临时文件"""
         if self.repo_temp_dir and os.path.exists(self.repo_temp_dir):
@@ -459,9 +515,7 @@ class SimpleSBOMGenerator:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-                content = self._normalize_json(content)
                 data = json.loads(content)
-                
                 # 获取主包的许可证信息
                 license_info = data.get('license', {})
                 if isinstance(license_info, str):
@@ -509,27 +563,6 @@ class SimpleSBOMGenerator:
             logger.warning(f"解析 package.json 文件 {file_path} 时出错: {e}")
         
         return dependencies
-    
-    def _normalize_json(self, content):
-        """
-        规范化 JSON 内容，移除注释和处理其他非标准JSON格式
-        
-        Args:
-            content (str): JSON 内容
-            
-        Returns:
-            str: 规范化后的 JSON 内容
-        """
-        # 移除单行注释 (//...)
-        content = re.sub(r'//.*$', '', content, flags=re.MULTILINE)
-        
-        # 移除多行注释 (/* ... */)
-        content = re.sub(r'/\*[\s\S]*?\*/', '', content)
-        
-        # 移除尾随逗号，这在标准JSON中是不允许的，但在一些项目中使用
-        content = re.sub(r',\s*([}\]])', r'\1', content)
-        
-        return content
     
     def _parse_go_mod(self, file_path):
         """解析 go.mod 文件"""
