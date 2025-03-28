@@ -23,6 +23,7 @@ from src.utils import (
     ensure_temp_directory,
     get_timestamp
 )
+import traceback
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +212,7 @@ class SimpleSBOMGenerator:
         Returns:
             List[Dict]: 增强后的包列表
         """
-        python_packages = [p for p in packages if p.get('supplier') == 'Organization: PyPI']
+        python_packages = [p for p in packages if p.get('supplier', '').startswith('Organization: PyPI')]
         if not python_packages:
             return packages
             
@@ -220,6 +221,9 @@ class SimpleSBOMGenerator:
         def process_package(package: Dict) -> Dict:
             package_name = package['name']
             pypi_info = self.pypi_client.get_package_info(package_name)
+            
+            # 保存任何现有的注释
+            original_comment = package.get('comment', '')
             
             if pypi_info and 'info' in pypi_info:
                 info = pypi_info['info']
@@ -238,7 +242,7 @@ class SimpleSBOMGenerator:
                 if not license_info and 'license' in info:
                     license_info = info['license']
                     # 如果主许可证字段过长（超过100个字符），则使用 classifiers 中的信息
-                    if len(license_info) > 100 and 'classifiers' in info:
+                    if license_info and len(license_info) > 100 and 'classifiers' in info:
                         license_classifiers = [c for c in info['classifiers'] if c.startswith('License :: ')]
                         if license_classifiers:
                             license_info = license_classifiers[-1].replace('License :: OSI Approved :: ', '')
@@ -270,6 +274,13 @@ class SimpleSBOMGenerator:
                     package['supplier'] = f"Person: {info['maintainer']}"
                 else:
                     package['supplier'] = "Organization: PyPI"
+                
+                # 重新添加原始注释
+                if original_comment:
+                    if 'comment' in package:
+                        package['comment'] = f"{package['comment']}; {original_comment}"
+                    else:
+                        package['comment'] = original_comment
             
             return package
         
@@ -281,10 +292,16 @@ class SimpleSBOMGenerator:
                 desc="获取 PyPI 信息"
             ))
         
-        # 更新原始包列表中的 Python 包信息
+        # 创建映射以更新原始包列表中的 Python 包信息
+        enhanced_map = {}
+        for pkg in enhanced_packages:
+            # 使用包的SPDXID作为键，确保不会混淆同名但版本不同的包
+            enhanced_map[pkg['SPDXID']] = pkg
+        
+        # 更新原始包列表
         for i, package in enumerate(packages):
-            if package.get('supplier') == 'Organization: PyPI':
-                packages[i] = enhanced_packages.pop(0)
+            if package.get('supplier', '').startswith('Organization: PyPI') and package['SPDXID'] in enhanced_map:
+                packages[i] = enhanced_map[package['SPDXID']]
         
         return packages
 
@@ -349,16 +366,55 @@ class SimpleSBOMGenerator:
         
         # 添加依赖关系信息
         dependencies = []
+        
+        # 使用复合键（包名+版本号+条件）去重
+        dep_keys = set()
+        
+        # 保存每个源文件的依赖项信息，用于日志记录
+        source_deps = {}
+        
         if package_files:
             logger.info(f"发现 {len(package_files)} 个包管理器文件，开始解析依赖项...")
             
             for manager, file_path in package_files:
                 abs_path = os.path.join(repo_dir, file_path)
                 if os.path.exists(abs_path):
+                    # 解析依赖项
                     extracted_deps = self._extract_dependencies(manager, abs_path)
+                    source_deps[file_path] = len(extracted_deps)
+                    
                     if extracted_deps:
-                        dependencies.extend(extracted_deps)
-                        logger.info(f"从 {file_path} 中提取了 {len(extracted_deps)} 个依赖项")
+                        # 使用精确的去重逻辑
+                        added_from_file = 0
+                        
+                        for dep in extracted_deps:
+                            dep_name = dep['name']
+                            version_info = dep['versionInfo']
+                            
+                            # 创建唯一键: 包名+版本号
+                            # 对于条件依赖，会将条件也包含在内，使不同条件的同名包被视为不同的依赖项
+                            key = f"{dep_name}|{version_info}"
+                            
+                            if key not in dep_keys:
+                                dependencies.append(dep)
+                                dep_keys.add(key)
+                                added_from_file += 1
+                            else:
+                                # 日志记录避免添加重复项
+                                logger.debug(f"跳过重复的依赖项: {dep_name} 版本: {version_info}")
+                        
+                        logger.info(f"从 {file_path} 中提取了 {len(extracted_deps)} 个依赖项，添加了 {added_from_file} 个新依赖项")
+                    else:
+                        logger.info(f"从 {file_path} 中未提取到依赖项")
+                else:
+                    logger.warning(f"无法访问文件: {abs_path}")
+        else:
+            logger.info("未找到包管理器文件")
+        
+        # 打印每个文件发现的依赖项数量，帮助调试
+        logger.info("每个包管理器文件中发现的依赖项数量:")
+        for file_path, count in source_deps.items():
+            logger.info(f"  - {file_path}: {count} 个依赖项")
         
         # 将依赖项添加到 packages 列表中
         for dep in dependencies:
@@ -367,7 +423,7 @@ class SimpleSBOMGenerator:
         # 通过 PyPI API 增强 Python 包信息
         packages = self._enhance_python_packages(packages)
         
-        logger.info(f"总共收集了 {len(packages)} 个包的信息")
+        logger.info(f"总共收集了 {len(packages)} 个包的信息 (包含 {len(dependencies)} 个依赖项)")
         
         # 创建 SBOM 文档
         sbom_document = {
@@ -440,21 +496,33 @@ class SimpleSBOMGenerator:
             list: 依赖项列表
         """
         dependencies = []
+        file_basename = os.path.basename(file_path)
         
         try:
             if manager == 'Python':
-                if file_path.endswith('requirements.txt'):
+                if file_path.endswith('requirements.txt') or 'requirements' in file_path.lower() and file_path.endswith('.txt'):
+                    logger.info(f"使用requirements.txt解析器处理文件: {file_basename}")
                     dependencies.extend(self._parse_requirements_txt(file_path))
                 elif file_path.endswith('setup.py'):
+                    logger.info(f"使用setup.py解析器处理文件: {file_basename}")
                     dependencies.extend(self._parse_setup_py(file_path))
                 elif file_path.endswith('Pipfile'):
+                    logger.info(f"使用Pipfile解析器处理文件: {file_basename}")
                     dependencies.extend(self._parse_pipfile(file_path))
                 elif file_path.endswith('pyproject.toml'):
+                    logger.info(f"使用pyproject.toml解析器处理文件: {file_basename}")
                     dependencies.extend(self._parse_pyproject_toml(file_path))
             
             elif manager == 'JavaScript/Node.js':
                 if file_path.endswith('package.json'):
+                    logger.info(f"使用package.json解析器处理文件: {file_basename}")
                     dependencies.extend(self._parse_package_json(file_path))
+                elif file_path.endswith('package-lock.json'):
+                    logger.info(f"使用package-lock.json解析器处理文件: {file_basename}")
+                    dependencies.extend(self._parse_package_lock_json(file_path))
+                elif file_path.endswith('yarn.lock'):
+                    logger.info(f"使用yarn.lock解析器处理文件: {file_basename}")
+                    dependencies.extend(self._parse_yarn_lock(file_path))
             
             elif manager == 'Go':
                 if file_path.endswith('go.mod'):
@@ -466,47 +534,276 @@ class SimpleSBOMGenerator:
                 elif file_path.endswith('.gradle') or file_path.endswith('.gradle.kts'):
                     dependencies.extend(self._parse_gradle(file_path))
             
+            elif manager == 'Ruby':
+                if file_path.endswith('Gemfile') or file_path.endswith('Gemfile.lock'):
+                    dependencies.extend(self._parse_gemfile(file_path))
+                elif file_path.endswith('.gemspec'):
+                    dependencies.extend(self._parse_gemspec(file_path))
+            
+            elif manager == 'PHP':
+                if file_path.endswith('composer.json') or file_path.endswith('composer.lock'):
+                    dependencies.extend(self._parse_composer_json(file_path))
+            
+            elif manager == 'Rust':
+                if file_path.endswith('Cargo.toml') or file_path.endswith('Cargo.lock'):
+                    dependencies.extend(self._parse_cargo_toml(file_path))
+            
+            elif manager == 'Dart/Flutter':
+                if file_path.endswith('pubspec.yaml'):
+                    dependencies.extend(self._parse_pubspec_yaml(file_path))
+            
             # 可以根据需要添加更多的包管理器解析逻辑
+            
+            if dependencies:
+                logger.info(f"从 {file_basename} 中提取了 {len(dependencies)} 个依赖项")
+            else:
+                # 如果未提取到依赖项，尝试使用通用的requirements.txt解析器
+                if file_path.endswith('.txt') and manager == 'Python':
+                    # 检查文件内容是否类似于 requirements.txt
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            # 检查是否包含常见的requirements.txt模式
+                            if re.search(r'([a-zA-Z0-9._-]+)([<>=~!][<>=~!]?.*)', content) or \
+                               re.search(r'^--index-url', content, re.MULTILINE) or \
+                               re.search(r'^-r\s+', content, re.MULTILINE):
+                                logger.info(f"尝试将 {file_basename} 作为 requirements.txt 进行解析")
+                                dependencies.extend(self._parse_requirements_txt(file_path))
+                                logger.info(f"通过备选方式从 {file_basename} 中提取了 {len(dependencies)} 个依赖项")
+                    except Exception as e:
+                        logger.warning(f"尝试备选解析方式时出错: {e}")
+                
+                # 尝试处理未识别的yarn.lock文件
+                elif file_path.endswith('.lock') and 'yarn' in file_basename.lower():
+                    logger.info(f"尝试以yarn.lock方式解析: {file_basename}")
+                    try:
+                        dependencies.extend(self._parse_yarn_lock(file_path))
+                        logger.info(f"通过备选方式从 {file_basename} 中提取了 {len(dependencies)} 个依赖项")
+                    except Exception as e:
+                        logger.warning(f"尝试yarn.lock备选解析方式时出错: {e}")
             
         except Exception as e:
             logger.warning(f"解析依赖项文件 {file_path} 时出错: {e}")
+            logger.debug(f"详细错误: {traceback.format_exc()}")
         
         return dependencies
     
     def _parse_requirements_txt(self, file_path):
         """解析 requirements.txt 文件"""
         dependencies = []
+        processed_files = set()  # 用于跟踪已处理的文件，避免循环引用
         
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    # 删除注释和空格
-                    line = line.split('#')[0].strip()
-                    if not line or line.startswith('-') or line.startswith('--'):
-                        continue
-                    
-                    # 处理包名和版本
-                    parts = re.split(r'[<>=~]', line, 1)
-                    package_name = parts[0].strip()
-                    
-                    if len(parts) > 1:
-                        version = line[len(package_name):].strip()
-                    else:
-                        version = "NOASSERTION"
-                    
-                    dependencies.append({
-                        "name": package_name,
-                        "SPDXID": f"SPDXRef-Package-{package_name}",
-                        "versionInfo": version,
-                        "downloadLocation": f"https://pypi.org/project/{package_name}/",
-                        "licenseConcluded": "NOASSERTION",
-                        "licenseDeclared": "NOASSERTION",
-                        "copyrightText": "NOASSERTION",
-                        "supplier": "Organization: PyPI"
-                    })
-        except Exception as e:
-            logger.warning(f"解析 requirements.txt 文件 {file_path} 时出错: {e}")
+        # 提取文件基本名用于日志显示
+        file_basename = os.path.basename(file_path)
+        logger.info(f"开始解析 {file_basename}")
         
+        def parse_file(file_path, processed_files):
+            """递归解析requirements文件及其引用的文件"""
+            if file_path in processed_files:
+                return []  # 避免循环引用
+            
+            processed_files.add(file_path)
+            local_dependencies = []
+            file_basename = os.path.basename(file_path)
+            
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    lines = content.split('\n')
+                    
+                    # 跟踪前缀选项的状态，例如 --index-url
+                    current_index_url = None
+                    
+                    for line_num, line in enumerate(lines, 1):
+                        original_line = line
+                        # 删除注释和空格
+                        line = line.split('#')[0].strip()
+                        if not line:
+                            continue
+                        
+                        # 处理选项行
+                        if line.startswith('--'):
+                            # 记录 index-url 以便在日志中显示
+                            if line.startswith('--index-url'):
+                                parts = line.split('--index-url', 1)[1].strip()
+                                current_index_url = parts
+                                logger.info(f"检测到自定义索引URL: {current_index_url}")
+                            continue
+                        
+                        # 处理文件引用 (-r file.txt 或 --requirement file.txt)
+                        if line.startswith('-r ') or line.startswith('--requirement '):
+                            referenced_file = line.split(' ', 1)[1].strip()
+                            # 确定引用文件的路径
+                            ref_path = os.path.join(os.path.dirname(file_path), referenced_file)
+                            
+                            # 尝试多种路径可能性
+                            if not os.path.exists(ref_path):
+                                # 尝试通用名称匹配
+                                alt_refs = [
+                                    ref_path,  # 原始路径
+                                    os.path.abspath(referenced_file),  # 绝对路径
+                                    referenced_file,  # 仅文件名
+                                    os.path.join(os.getcwd(), referenced_file)  # 当前工作目录
+                                ]
+                                
+                                # 查找匹配的文件
+                                for alt_ref in alt_refs:
+                                    if os.path.exists(alt_ref):
+                                        ref_path = alt_ref
+                                        break
+                            
+                            if os.path.exists(ref_path):
+                                logger.info(f"处理引用的文件: {referenced_file}")
+                                # 递归解析引用的文件
+                                ref_deps = parse_file(ref_path, processed_files)
+                                local_dependencies.extend(ref_deps)
+                                logger.info(f"从 {referenced_file} 中解析了 {len(ref_deps)} 个依赖项")
+                            else:
+                                logger.warning(f"引用的文件不存在: {referenced_file} (从 {file_basename} 行 {line_num})")
+                            continue
+                        
+                        # 跳过其他选项行，但打印日志以便调试
+                        if line.startswith('-'):
+                            logger.debug(f"跳过选项行: {line}")
+                            continue
+                        
+                        # 处理条件性依赖 (包名==版本; 条件)
+                        # 特殊处理引号内的分号，避免错误拆分
+                        condition = None
+                        
+                        # 查找所有不在引号内的分号
+                        semicolons = []
+                        in_single_quote = False
+                        in_double_quote = False
+                        
+                        for i, char in enumerate(line):
+                            if char == "'" and (i == 0 or line[i-1] != '\\'):
+                                in_single_quote = not in_single_quote
+                            elif char == '"' and (i == 0 or line[i-1] != '\\'):
+                                in_double_quote = not in_double_quote
+                            elif char == ';' and not in_single_quote and not in_double_quote:
+                                semicolons.append(i)
+                        
+                        if semicolons:
+                            # 取第一个不在引号内的分号作为分隔
+                            pkg_spec = line[:semicolons[0]].strip()
+                            condition = line[semicolons[0]+1:].strip()
+                        else:
+                            pkg_spec = line
+                        
+                        # 处理egg格式，例如：package @ git+https://....git#egg=package
+                        if '@' in pkg_spec and '#egg=' in pkg_spec.lower():
+                            egg_part = pkg_spec.split('#egg=', 1)[1]
+                            if egg_part:
+                                package_name = egg_part.strip().split('[')[0].strip()
+                                version = "from git"
+                                pkg_source = pkg_spec.split('@', 1)[1].strip()
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{package_name}|{version}|{condition}".encode()).hexdigest()
+                                
+                                local_dependencies.append({
+                                    "name": package_name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version + (f" ; {condition}" if condition else ""),
+                                    "downloadLocation": pkg_source,
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename}" + (f" (via {current_index_url})" if current_index_url else "")
+                                })
+                                continue
+                        
+                        # 处理包名和版本
+                        # 检查是否有版本操作符（考虑引号情况）
+                        version_match = None
+                        in_single_quote = False
+                        in_double_quote = False
+                        
+                        for i, char in enumerate(pkg_spec):
+                            if char == "'" and (i == 0 or pkg_spec[i-1] != '\\'):
+                                in_single_quote = not in_single_quote
+                            elif char == '"' and (i == 0 or pkg_spec[i-1] != '\\'):
+                                in_double_quote = not in_double_quote
+                            # 只在不在引号内时匹配版本操作符
+                            elif not in_single_quote and not in_double_quote:
+                                # 查找版本操作符
+                                if char in '<>=~!':
+                                    # 确认这是一个版本操作符
+                                    if (i+1 < len(pkg_spec) and pkg_spec[i+1] in '=<>') or char == '~':
+                                        version_match = i
+                                        break
+                                    elif char in '<>=!':
+                                        version_match = i
+                                        break
+                        
+                        if version_match is not None:
+                            package_name = pkg_spec[:version_match].strip()
+                            version = pkg_spec[version_match:].strip()
+                        else:
+                            # 检查是否有引号包裹的包名
+                            if (pkg_spec.startswith('"') and pkg_spec.endswith('"')) or \
+                               (pkg_spec.startswith("'") and pkg_spec.endswith("'")):
+                                package_name = pkg_spec[1:-1].strip()
+                            else:
+                                package_name = pkg_spec.strip()
+                            version = "NOASSERTION"
+                        
+                        # 处理包名中的引号
+                        if (package_name.startswith('"') and package_name.endswith('"')) or \
+                           (package_name.startswith("'") and package_name.endswith("'")):
+                            package_name = package_name[1:-1]
+                        
+                        # 移除包名中的空格
+                        package_name = package_name.strip()
+                        
+                        # 跳过空包名（可能是由于格式错误导致）
+                        if not package_name:
+                            logger.warning(f"跳过空包名: {original_line}")
+                            continue
+                            
+                        # 处理包名中的可选部分，如 package[extra]
+                        base_package_name = package_name
+                        extras = None
+                        if '[' in package_name and package_name.endswith(']'):
+                            base_package_name = package_name.split('[')[0]
+                            extras = package_name.split('[')[1][:-1]
+                        
+                        # 如果有条件，将条件添加到版本信息中
+                        if condition:
+                            # 清理条件中的多余引号
+                            condition = condition.strip()
+                            version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                        else:
+                            version_with_condition = version
+                        
+                        # 创建一个唯一ID，包含包名、版本和条件
+                        unique_id = hashlib.md5(f"{base_package_name}|{version_with_condition}".encode()).hexdigest()
+                        
+                        local_dependencies.append({
+                            "name": base_package_name,
+                            "SPDXID": f"SPDXRef-Package-{unique_id}",
+                            "versionInfo": version_with_condition,
+                            "downloadLocation": f"https://pypi.org/project/{base_package_name}/",
+                            "licenseConcluded": "NOASSERTION",
+                            "licenseDeclared": "NOASSERTION",
+                            "copyrightText": "NOASSERTION",
+                            "supplier": "Organization: PyPI",
+                            "comment": f"From {file_basename}" + 
+                                      (f", extras: {extras}" if extras else "") + 
+                                      (f" (via {current_index_url})" if current_index_url else "")
+                        })
+            except Exception as e:
+                logger.warning(f"解析 requirements 文件 {file_path} 时出错: {e}")
+                # 打印更详细的错误信息进行调试
+                logger.debug(f"详细错误: {traceback.format_exc()}")
+            
+            return local_dependencies
+        
+        # 开始解析主文件
+        dependencies = parse_file(file_path, processed_files)
+        logger.info(f"从 {file_basename} 及其引用文件中共解析了 {len(dependencies)} 个依赖项")
         return dependencies
     
     def _parse_package_json(self, file_path):
@@ -649,6 +946,8 @@ class SimpleSBOMGenerator:
     def _parse_setup_py(self, file_path):
         """解析 setup.py 文件（简化版本）"""
         dependencies = []
+        file_basename = os.path.basename(file_path)
+        logger.info(f"开始解析 {file_basename}")
         
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -664,69 +963,180 @@ class SimpleSBOMGenerator:
                         req = dep.group(1).strip()
                         
                         # 处理包名和版本
-                        parts = re.split(r'[<>=~]', req, 1)
+                        parts = re.split(r'([<>=~!]+)', req, 1)
                         package_name = parts[0].strip()
                         
                         if len(parts) > 1:
-                            version = req[len(package_name):].strip()
+                            version = ''.join(parts[1:]).strip()
                         else:
                             version = "NOASSERTION"
                         
+                        # 跳过空包名
+                        if not package_name:
+                            continue
+                            
+                        # 处理可能的条件依赖
+                        condition = None
+                        if ';' in version:
+                            version_parts = version.split(';', 1)
+                            version = version_parts[0].strip()
+                            condition = version_parts[1].strip()
+                            
+                        # 如果有条件，将条件添加到版本信息中
+                        if condition:
+                            version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                        else:
+                            version_with_condition = version
+                            
+                        # 创建唯一ID
+                        unique_id = hashlib.md5(f"{package_name}|{version_with_condition}".encode()).hexdigest()
+                        
                         dependencies.append({
                             "name": package_name,
-                            "SPDXID": f"SPDXRef-Package-{package_name}",
-                            "versionInfo": version,
+                            "SPDXID": f"SPDXRef-Package-{unique_id}",
+                            "versionInfo": version_with_condition,
                             "downloadLocation": f"https://pypi.org/project/{package_name}/",
                             "licenseConcluded": "NOASSERTION",
                             "licenseDeclared": "NOASSERTION",
                             "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: PyPI"
+                            "supplier": "Organization: PyPI",
+                            "comment": f"From {file_basename} (install_requires)"
                         })
+                
+                # 查找 extras_require 字典
+                extras_match = re.search(r'extras_require\s*=\s*{(.*?)}', content, re.DOTALL)
+                if extras_match:
+                    extras_str = extras_match.group(1)
+                    
+                    # 提取每个额外依赖组
+                    extras_sections = re.finditer(r'[\'"]([^\'"]+)[\'"]\s*:\s*\[(.*?)\]', extras_str, re.DOTALL)
+                    for section in extras_sections:
+                        extra_name = section.group(1)
+                        extra_deps = section.group(2)
+                        
+                        # 提取每个依赖项
+                        for dep in re.finditer(r'[\'"]([^\'"]+)[\'"]', extra_deps):
+                            req = dep.group(1).strip()
+                            
+                            # 处理包名和版本
+                            parts = re.split(r'([<>=~!]+)', req, 1)
+                            package_name = parts[0].strip()
+                            
+                            if len(parts) > 1:
+                                version = ''.join(parts[1:]).strip()
+                            else:
+                                version = "NOASSERTION"
+                            
+                            # 处理可能的条件依赖
+                            condition = None
+                            if ';' in version:
+                                version_parts = version.split(';', 1)
+                                version = version_parts[0].strip()
+                                condition = version_parts[1].strip()
+                                
+                            # 如果有条件，将条件添加到版本信息中
+                            if condition:
+                                version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                            else:
+                                version_with_condition = version
+                                
+                            # 创建唯一ID，包含额外依赖组信息
+                            unique_id = hashlib.md5(f"{package_name}|{version_with_condition}|{extra_name}".encode()).hexdigest()
+                            
+                            dependencies.append({
+                                "name": package_name,
+                                "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                "versionInfo": version_with_condition,
+                                "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: PyPI",
+                                "comment": f"From {file_basename} (extras_require.{extra_name})"
+                            })
+                
+                logger.info(f"从 {file_basename} 中解析了 {len(dependencies)} 个依赖项")
+                
         except Exception as e:
             logger.warning(f"解析 setup.py 文件 {file_path} 时出错: {e}")
+            logger.debug(f"详细错误: {traceback.format_exc()}")
         
         return dependencies
     
     def _parse_pipfile(self, file_path):
         """简化版 Pipfile 解析"""
         dependencies = []
-        in_packages_section = False
+        file_basename = os.path.basename(file_path)
+        logger.info(f"开始解析 {file_basename}")
         
         try:
+            current_section = None
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     
-                    if line == '[packages]':
-                        in_packages_section = True
-                        continue
-                    elif line.startswith('[') and line.endswith(']'):
-                        in_packages_section = False
+                    # 跳过空行和注释
+                    if not line or line.startswith('#'):
                         continue
                     
-                    if in_packages_section and '=' in line:
+                    # 处理段落标签
+                    if line.startswith('[') and line.endswith(']'):
+                        current_section = line[1:-1].lower()
+                        logger.debug(f"处理 Pipfile 段落: {current_section}")
+                        continue
+                    
+                    # 只处理packages和dev-packages段落
+                    if current_section in ['packages', 'dev-packages'] and '=' in line:
                         parts = line.split('=', 1)
                         package_name = parts[0].strip().strip('"\'')
-                        version = parts[1].strip().strip('"\'')
+                        version_raw = parts[1].strip()
+                        
+                        # 处理版本格式 (可能包含引号、花括号等)
+                        if version_raw.startswith('{') and version_raw.endswith('}'):
+                            # 复杂版本说明，如 {version=">=1.0.0", extras=["full"]}
+                            version_dict = {}
+                            version_parts = version_raw[1:-1].split(',')
+                            for part in version_parts:
+                                if '=' in part:
+                                    k, v = part.split('=', 1)
+                                    version_dict[k.strip()] = v.strip().strip('"\'')
+                            
+                            version = version_dict.get('version', 'NOASSERTION')
+                            extras = version_dict.get('extras', None)
+                            extras_str = f", extras: {extras}" if extras else ""
+                        else:
+                            # 简单版本，如 ">=1.0.0"
+                            version = version_raw.strip('"\'')
+                            extras_str = ""
+                        
+                        # 创建唯一ID
+                        unique_id = hashlib.md5(f"{package_name}|{version}|{current_section}".encode()).hexdigest()
                         
                         dependencies.append({
                             "name": package_name,
-                            "SPDXID": f"SPDXRef-Package-{package_name}",
+                            "SPDXID": f"SPDXRef-Package-{unique_id}",
                             "versionInfo": version,
                             "downloadLocation": f"https://pypi.org/project/{package_name}/",
                             "licenseConcluded": "NOASSERTION",
                             "licenseDeclared": "NOASSERTION",
                             "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: PyPI"
+                            "supplier": "Organization: PyPI",
+                            "comment": f"From {file_basename} ({current_section}){extras_str}"
                         })
+            
+            logger.info(f"从 {file_basename} 中解析了 {len(dependencies)} 个依赖项")
+            
         except Exception as e:
             logger.warning(f"解析 Pipfile 文件 {file_path} 时出错: {e}")
+            logger.debug(f"详细错误: {traceback.format_exc()}")
         
         return dependencies
     
     def _parse_pyproject_toml(self, file_path):
         """简化版 pyproject.toml 解析"""
         dependencies = []
+        file_basename = os.path.basename(file_path)
+        logger.info(f"解析 {file_basename}")
         
         try:
             # 使用 toml 库解析
@@ -735,54 +1145,205 @@ class SimpleSBOMGenerator:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         data = toml.load(f)
                     
-                    # 处理 poetry 依赖
-                    if 'tool' in data and 'poetry' in data['tool'] and 'dependencies' in data['tool']['poetry']:
-                        for name, version_info in data['tool']['poetry']['dependencies'].items():
-                            if name == 'python':  # 跳过 python 解释器版本
-                                continue
-                                
-                            # 处理不同格式的版本信息
-                            if isinstance(version_info, str):
-                                version = version_info
-                            elif isinstance(version_info, dict) and 'version' in version_info:
-                                version = version_info['version']
-                            else:
-                                version = "NOASSERTION"
-                            
-                            dependencies.append({
-                                "name": name,
-                                "SPDXID": f"SPDXRef-Package-{name}",
-                                "versionInfo": version,
-                                "downloadLocation": f"https://pypi.org/project/{name}/",
-                                "licenseConcluded": "NOASSERTION",
-                                "licenseDeclared": "NOASSERTION",
-                                "copyrightText": "NOASSERTION",
-                                "supplier": "Organization: PyPI"
-                            })
-                    
-                    # 处理 PEP 621 项目依赖
+                    # 处理 PEP 621 格式 (project.dependencies)
                     if 'project' in data and 'dependencies' in data['project']:
-                        for dep in data['project']['dependencies']:
-                            # 处理 PEP 508 格式的依赖说明
-                            parts = re.split(r'[<>=~]', dep, 1)
-                            package_name = parts[0].strip()
-                            
-                            if len(parts) > 1:
-                                version = dep[len(package_name):].strip()
-                            else:
-                                version = "NOASSERTION"
+                        project_deps = data['project']['dependencies']
+                        if isinstance(project_deps, list):
+                            for dep in project_deps:
+                                # 分离条件依赖
+                                pkg_spec = dep
+                                condition = None
                                 
-                            dependencies.append({
-                                "name": package_name,
-                                "SPDXID": f"SPDXRef-Package-{package_name}",
-                                "versionInfo": version,
-                                "downloadLocation": f"https://pypi.org/project/{package_name}/",
-                                "licenseConcluded": "NOASSERTION",
-                                "licenseDeclared": "NOASSERTION",
-                                "copyrightText": "NOASSERTION",
-                                "supplier": "Organization: PyPI"
-                            })
+                                # 查找不在引号内的分号
+                                semicolons = []
+                                in_single_quote = False
+                                in_double_quote = False
+                                
+                                for i, char in enumerate(pkg_spec):
+                                    if char == "'" and (i == 0 or pkg_spec[i-1] != '\\'):
+                                        in_single_quote = not in_single_quote
+                                    elif char == '"' and (i == 0 or pkg_spec[i-1] != '\\'):
+                                        in_double_quote = not in_double_quote
+                                    elif char == ';' and not in_single_quote and not in_double_quote:
+                                        semicolons.append(i)
+                                
+                                if semicolons:
+                                    # 取第一个不在引号内的分号作为分隔
+                                    pkg_spec = dep[:semicolons[0]].strip()
+                                    condition = dep[semicolons[0]+1:].strip()
+                                
+                                # 处理包名和版本
+                                match = re.search(r'([a-zA-Z0-9._-]+)([<>=~!][<>=~!]?.*)', pkg_spec)
+                                if match:
+                                    package_name = match.group(1).strip()
+                                    version = match.group(2).strip()
+                                else:
+                                    package_name = pkg_spec.strip()
+                                    version = "NOASSERTION"
+                                
+                                # 如果有条件，将条件添加到版本信息中
+                                if condition:
+                                    version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                                else:
+                                    version_with_condition = version
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{package_name}|{version_with_condition}".encode()).hexdigest()
+                                
+                                dependencies.append({
+                                    "name": package_name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version_with_condition,
+                                    "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename} (project.dependencies)"
+                                })
+                        elif isinstance(project_deps, dict):
+                            # 处理字典形式的依赖声明
+                            for name, version_info in project_deps.items():
+                                if name == 'python':  # 跳过 python 解释器版本
+                                    continue
+                                    
+                                # 处理不同格式的版本信息
+                                if isinstance(version_info, str):
+                                    version = version_info
+                                elif isinstance(version_info, dict) and 'version' in version_info:
+                                    version = version_info['version']
+                                else:
+                                    version = "NOASSERTION"
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{name}|{version}".encode()).hexdigest()
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://pypi.org/project/{name}/",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename} (project.dependencies)"
+                                })
                     
+                    # 处理 poetry 依赖
+                    if 'tool' in data and 'poetry' in data['tool']:
+                        if 'dependencies' in data['tool']['poetry']:
+                            for name, version_info in data['tool']['poetry']['dependencies'].items():
+                                if name == 'python':  # 跳过 python 解释器版本
+                                    continue
+                                    
+                                # 处理不同格式的版本信息
+                                if isinstance(version_info, str):
+                                    version = version_info
+                                elif isinstance(version_info, dict) and 'version' in version_info:
+                                    version = version_info['version']
+                                else:
+                                    version = "NOASSERTION"
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{name}|{version}".encode()).hexdigest()
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://pypi.org/project/{name}/",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename} (poetry.dependencies)"
+                                })
+                        
+                        # 处理开发依赖
+                        if 'dev-dependencies' in data['tool']['poetry']:
+                            for name, version_info in data['tool']['poetry']['dev-dependencies'].items():
+                                # 处理不同格式的版本信息
+                                if isinstance(version_info, str):
+                                    version = version_info
+                                elif isinstance(version_info, dict) and 'version' in version_info:
+                                    version = version_info['version']
+                                else:
+                                    version = "NOASSERTION"
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{name}|{version}".encode()).hexdigest()
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://pypi.org/project/{name}/",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename} (poetry.dev-dependencies)"
+                                })
+                    
+                    # 处理 optional-dependencies
+                    if 'project' in data and 'optional-dependencies' in data['project']:
+                        for group_name, deps in data['project']['optional-dependencies'].items():
+                            if isinstance(deps, list):
+                                for dep in deps:
+                                    # 分离条件依赖
+                                    pkg_spec = dep
+                                    condition = None
+                                    
+                                    # 查找不在引号内的分号
+                                    semicolons = []
+                                    in_single_quote = False
+                                    in_double_quote = False
+                                    
+                                    for i, char in enumerate(pkg_spec):
+                                        if char == "'" and (i == 0 or pkg_spec[i-1] != '\\'):
+                                            in_single_quote = not in_single_quote
+                                        elif char == '"' and (i == 0 or pkg_spec[i-1] != '\\'):
+                                            in_double_quote = not in_double_quote
+                                        elif char == ';' and not in_single_quote and not in_double_quote:
+                                            semicolons.append(i)
+                                    
+                                    if semicolons:
+                                        # 取第一个不在引号内的分号作为分隔
+                                        pkg_spec = dep[:semicolons[0]].strip()
+                                        condition = dep[semicolons[0]+1:].strip()
+                                    
+                                    # 处理包名和版本
+                                    match = re.search(r'([a-zA-Z0-9._-]+)([<>=~!][<>=~!]?.*)', pkg_spec)
+                                    if match:
+                                        package_name = match.group(1).strip()
+                                        version = match.group(2).strip()
+                                    else:
+                                        package_name = pkg_spec.strip()
+                                        version = "NOASSERTION"
+                                    
+                                    # 如果有条件，将条件添加到版本信息中
+                                    if condition:
+                                        version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                                    else:
+                                        version_with_condition = version
+                                    
+                                    # 创建唯一ID
+                                    unique_id = hashlib.md5(f"{package_name}|{version_with_condition}|{group_name}".encode()).hexdigest()
+                                    
+                                    dependencies.append({
+                                        "name": package_name,
+                                        "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                        "versionInfo": version_with_condition,
+                                        "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                        "licenseConcluded": "NOASSERTION",
+                                        "licenseDeclared": "NOASSERTION",
+                                        "copyrightText": "NOASSERTION",
+                                        "supplier": "Organization: PyPI",
+                                        "comment": f"From {file_basename} (optional-dependencies.{group_name})"
+                                    })
+                    
+                    logger.info(f"从 {file_basename} 中使用 toml 库解析了 {len(dependencies)} 个依赖项")
                     return dependencies
                 except Exception as e:
                     logger.warning(f"使用 toml 库解析 {file_path} 时出错: {e}，将尝试简单解析方式")
@@ -791,36 +1352,109 @@ class SimpleSBOMGenerator:
             
             # 简单的行解析方式（作为备选方案）
             in_dependencies_section = False
+            section_name = ""
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
                     
-                    if line == '[tool.poetry.dependencies]' or line == '[project.dependencies]':
+                    # 检查各种依赖段落
+                    if (line == '[tool.poetry.dependencies]' or 
+                        line == '[project.dependencies]' or 
+                        line == 'dependencies = ['):
                         in_dependencies_section = True
+                        section_name = line.strip('[]')
                         continue
                     elif line.startswith('[') and line.endswith(']'):
                         in_dependencies_section = False
+                        section_name = ""
                         continue
                     
-                    if in_dependencies_section and '=' in line:
-                        parts = line.split('=', 1)
-                        package_name = parts[0].strip().strip('"\'')
-                        
-                        if package_name == 'python':  # 跳过 python 解释器版本
-                            continue
+                    if in_dependencies_section:
+                        # 匹配依赖项行
+                        if '=' in line or line.strip().startswith('"') or line.strip().startswith("'"):
+                            # 清理行中的引号、逗号等
+                            clean_line = line.strip().strip(',').strip('"\'')
                             
-                        version = parts[1].strip().strip('"\'')
-                        
-                        dependencies.append({
-                            "name": package_name,
-                            "SPDXID": f"SPDXRef-Package-{package_name}",
-                            "versionInfo": version,
-                            "downloadLocation": f"https://pypi.org/project/{package_name}/",
-                            "licenseConcluded": "NOASSERTION",
-                            "licenseDeclared": "NOASSERTION",
-                            "copyrightText": "NOASSERTION",
-                            "supplier": "Organization: PyPI"
-                        })
+                            # 尝试匹配格式为 "package = version" 的行
+                            parts = re.split(r'\s*=\s*', clean_line, 1)
+                            
+                            if len(parts) == 2:
+                                package_name = parts[0].strip().strip('"\'')
+                                version_part = parts[1].strip().strip('"\'')
+                                
+                                if package_name == 'python':  # 跳过 python 解释器版本
+                                    continue
+                                
+                                # 分离条件依赖
+                                condition = None
+                                if ';' in version_part:
+                                    version_parts = version_part.split(';', 1)
+                                    version = version_parts[0].strip()
+                                    condition = version_parts[1].strip()
+                                else:
+                                    version = version_part
+                                
+                                # 如果有条件，将条件添加到版本信息中
+                                if condition:
+                                    version_with_condition = f"{version} ; {condition}"
+                                else:
+                                    version_with_condition = version
+                                
+                                # 创建唯一ID
+                                unique_id = hashlib.md5(f"{package_name}|{version_with_condition}|{section_name}".encode()).hexdigest()
+                                
+                                dependencies.append({
+                                    "name": package_name,
+                                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                    "versionInfo": version_with_condition,
+                                    "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: PyPI",
+                                    "comment": f"From {file_basename} ({section_name})"
+                                })
+                            else:
+                                # 尝试匹配列表项格式: "package>=version"
+                                clean_line = clean_line.strip('"\'').strip(',')
+                                
+                                # 分离条件依赖
+                                condition = None
+                                if ';' in clean_line:
+                                    parts = clean_line.split(';', 1)
+                                    pkg_spec = parts[0].strip()
+                                    condition = parts[1].strip()
+                                else:
+                                    pkg_spec = clean_line
+                                
+                                # 处理包名和版本
+                                match = re.search(r'([a-zA-Z0-9._-]+)([<>=~!][<>=~!]?.*)?', pkg_spec)
+                                if match:
+                                    package_name = match.group(1).strip()
+                                    version = match.group(2).strip() if match.group(2) else "NOASSERTION"
+                                    
+                                    # 如果有条件，将条件添加到版本信息中
+                                    if condition:
+                                        version_with_condition = f"{version} ; {condition}" if version != "NOASSERTION" else f"NOASSERTION ; {condition}"
+                                    else:
+                                        version_with_condition = version
+                                    
+                                    # 创建唯一ID
+                                    unique_id = hashlib.md5(f"{package_name}|{version_with_condition}|{section_name}".encode()).hexdigest()
+                                    
+                                    dependencies.append({
+                                        "name": package_name,
+                                        "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                        "versionInfo": version_with_condition,
+                                        "downloadLocation": f"https://pypi.org/project/{package_name}/",
+                                        "licenseConcluded": "NOASSERTION",
+                                        "licenseDeclared": "NOASSERTION",
+                                        "copyrightText": "NOASSERTION",
+                                        "supplier": "Organization: PyPI",
+                                        "comment": f"From {file_basename} ({section_name})"
+                                    })
+            
+            logger.info(f"从 {file_basename} 中使用备选方式解析了 {len(dependencies)} 个依赖项")
                         
         except Exception as e:
             logger.warning(f"解析 pyproject.toml 文件 {file_path} 时出错: {e}")
@@ -1045,3 +1679,601 @@ class SimpleSBOMGenerator:
                 f.write(f"Created: {sbom_document['creationInfo']['created']}\n")
                 f.write(f"LicenseListVersion: {sbom_document['creationInfo']['licenseListVersion']}\n")
                 # 更多 tag-value 对将在真实实现中写入 
+    
+    def _parse_package_lock_json(self, file_path):
+        """解析 package-lock.json 文件"""
+        dependencies = []
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                data = json.loads(content)
+                
+                # 获取锁定的依赖项
+                if 'dependencies' in data and isinstance(data['dependencies'], dict):
+                    for name, info in data['dependencies'].items():
+                        if not isinstance(name, str) or not name:
+                            continue
+                        
+                        # 获取版本信息
+                        version = info.get('version', 'NOASSERTION')
+                        
+                        # 获取依赖项的基本信息
+                        resolved = info.get('resolved', f"https://www.npmjs.com/package/{name}")
+                        integrity = info.get('integrity', 'NOASSERTION')
+                        
+                        # 获取许可证信息
+                        license_declared = 'NOASSERTION'
+                        if 'license' in info:
+                            license_declared = info['license']
+                        
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{name}",
+                            "versionInfo": version,
+                            "downloadLocation": resolved,
+                            "licenseConcluded": license_declared,
+                            "licenseDeclared": license_declared,
+                            "copyrightText": "NOASSERTION",
+                            "supplier": "Organization: npm",
+                            "comment": f"Integrity: {integrity}"
+                        })
+                
+                # 处理 npm 7+ 版本中的依赖项扁平化列表
+                if 'packages' in data and isinstance(data['packages'], dict):
+                    for path, info in data['packages'].items():
+                        if path == "":  # 根包
+                            continue
+                        
+                        # 从路径中提取包名
+                        if path.startswith('node_modules/'):
+                            parts = path.split('/')
+                            if len(parts) > 1:
+                                name = parts[1]  # 获取包名
+                            else:
+                                continue
+                        else:
+                            name = path
+                        
+                        # 获取版本信息
+                        version = info.get('version', 'NOASSERTION')
+                        
+                        # 获取依赖项的其他信息
+                        resolved = info.get('resolved', f"https://www.npmjs.com/package/{name}")
+                        integrity = info.get('integrity', 'NOASSERTION')
+                        
+                        # 获取许可证信息
+                        license_declared = 'NOASSERTION'
+                        if 'license' in info:
+                            license_declared = info['license']
+                        
+                        # 添加依赖项
+                        spdx_id = f"SPDXRef-Package-{name}"
+                        
+                        # 避免重复添加
+                        if not any(d['SPDXID'] == spdx_id for d in dependencies):
+                            dependencies.append({
+                                "name": name,
+                                "SPDXID": spdx_id,
+                                "versionInfo": version,
+                                "downloadLocation": resolved,
+                                "licenseConcluded": license_declared,
+                                "licenseDeclared": license_declared,
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: npm",
+                                "comment": f"Integrity: {integrity}"
+                            })
+        
+        except Exception as e:
+            logger.warning(f"解析 package-lock.json 文件 {file_path} 时出错: {e}")
+        
+        return dependencies
+    
+    def _parse_gemfile(self, file_path):
+        """解析 Gemfile 或 Gemfile.lock 文件"""
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            if file_path.endswith('.lock'):
+                # 解析 Gemfile.lock
+                # 找到 GEM 部分
+                gem_section_match = re.search(r'GEM\s+remote:.*?\n(.*?)(?:\n\n|\Z)', content, re.DOTALL)
+                if gem_section_match:
+                    gem_section = gem_section_match.group(1)
+                    
+                    # 解析规范部分
+                    specs_section = re.search(r'PLATFORMS.*?\n(.*?)(?:\n\n|\Z)', content, re.DOTALL)
+                    if specs_section:
+                        specs = specs_section.group(1)
+                        
+                        # 匹配每个依赖项
+                        for match in re.finditer(r'^\s{4}([^\s(]+)(?:\s+\(([^)]+)\))?', specs, re.MULTILINE):
+                            name = match.group(1)
+                            version = match.group(2) if match.group(2) else "NOASSERTION"
+                            
+                            dependencies.append({
+                                "name": name,
+                                "SPDXID": f"SPDXRef-Package-{name}",
+                                "versionInfo": version,
+                                "downloadLocation": f"https://rubygems.org/gems/{name}",
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: RubyGems"
+                            })
+            else:
+                # 解析 Gemfile
+                # 找到 gem 声明
+                for match in re.finditer(r'^\s*gem\s+[\'"](.*?)[\'"](?:,\s*[\'"]?([^\'",]+)[\'"]?)?', content, re.MULTILINE):
+                    name = match.group(1)
+                    version = match.group(2) if match.group(2) else "NOASSERTION"
+                    
+                    dependencies.append({
+                        "name": name,
+                        "SPDXID": f"SPDXRef-Package-{name}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://rubygems.org/gems/{name}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: RubyGems"
+                    })
+        except Exception as e:
+            logger.warning(f"解析 Gemfile 文件 {file_path} 时出错: {e}")
+        
+        return dependencies
+    
+    def _parse_gemspec(self, file_path):
+        """解析 .gemspec 文件"""
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # 查找依赖项声明
+            # 匹配 add_dependency, add_runtime_dependency, add_development_dependency
+            for match in re.finditer(r'(?:add_dependency|add_runtime_dependency|add_development_dependency)\s*\(?[\'"](.*?)[\'"](?:,\s*[\'"]?([^\'",]+)[\'"]?)?', content):
+                name = match.group(1)
+                version = match.group(2) if match.group(2) else "NOASSERTION"
+                
+                dependencies.append({
+                    "name": name,
+                    "SPDXID": f"SPDXRef-Package-{name}",
+                    "versionInfo": version,
+                    "downloadLocation": f"https://rubygems.org/gems/{name}",
+                    "licenseConcluded": "NOASSERTION",
+                    "licenseDeclared": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                    "supplier": "Organization: RubyGems"
+                })
+                
+            # 尝试获取许可证信息
+            license_match = re.search(r'license\s*=\s*[\'"]([^\'"]+)[\'"]', content)
+            if license_match:
+                license_info = license_match.group(1)
+                
+                # 更新所有依赖项的许可证信息
+                for dep in dependencies:
+                    dep["licenseDeclared"] = license_info
+                    dep["licenseConcluded"] = license_info
+            
+            # 尝试获取作者信息
+            author_match = re.search(r'author\s*=\s*[\'"]([^\'"]+)[\'"]', content)
+            if author_match:
+                author = author_match.group(1)
+                
+                # 更新依赖项的版权信息
+                for dep in dependencies:
+                    dep["copyrightText"] = f"Copyright (c) {author}"
+        except Exception as e:
+            logger.warning(f"解析 gemspec 文件 {file_path} 时出错: {e}")
+        
+        return dependencies
+    
+    def _parse_composer_json(self, file_path):
+        """解析 composer.json 或 composer.lock 文件"""
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                data = json.loads(content)
+            
+            if file_path.endswith('.lock'):
+                # 解析 composer.lock
+                if 'packages' in data and isinstance(data['packages'], list):
+                    for package in data['packages']:
+                        name = package.get('name', '')
+                        if not name:
+                            continue
+                        
+                        version = package.get('version', 'NOASSERTION')
+                        license_info = package.get('license', ['NOASSERTION'])
+                        if isinstance(license_info, list) and license_info:
+                            license_declared = ', '.join(license_info)
+                        elif isinstance(license_info, str):
+                            license_declared = license_info
+                        else:
+                            license_declared = 'NOASSERTION'
+                        
+                        # 获取源信息
+                        source = package.get('source', {})
+                        download_url = source.get('url', f"https://packagist.org/packages/{name}")
+                        
+                        # 尝试获取作者信息
+                        authors = package.get('authors', [])
+                        supplier = "Organization: Packagist"
+                        if authors and isinstance(authors, list) and 'name' in authors[0]:
+                            supplier = f"Person: {authors[0]['name']}"
+                        
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{name}",
+                            "versionInfo": version,
+                            "downloadLocation": download_url,
+                            "licenseConcluded": license_declared,
+                            "licenseDeclared": license_declared,
+                            "copyrightText": "NOASSERTION",
+                            "supplier": supplier
+                        })
+            else:
+                # 解析 composer.json
+                # 获取 require 部分
+                if 'require' in data and isinstance(data['require'], dict):
+                    for name, version in data['require'].items():
+                        if name == 'php':  # 跳过 PHP 版本要求
+                            continue
+                            
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{name}",
+                            "versionInfo": version,
+                            "downloadLocation": f"https://packagist.org/packages/{name}",
+                            "licenseConcluded": "NOASSERTION",
+                            "licenseDeclared": "NOASSERTION",
+                            "copyrightText": "NOASSERTION",
+                            "supplier": "Organization: Packagist"
+                        })
+                
+                # 获取 require-dev 部分
+                if 'require-dev' in data and isinstance(data['require-dev'], dict):
+                    for name, version in data['require-dev'].items():
+                        dependencies.append({
+                            "name": name,
+                            "SPDXID": f"SPDXRef-Package-{name}",
+                            "versionInfo": version,
+                            "downloadLocation": f"https://packagist.org/packages/{name}",
+                            "licenseConcluded": "NOASSERTION",
+                            "licenseDeclared": "NOASSERTION",
+                            "copyrightText": "NOASSERTION",
+                            "supplier": "Organization: Packagist"
+                        })
+        except Exception as e:
+            logger.warning(f"解析 composer.json/lock 文件 {file_path} 时出错: {e}")
+        
+        return dependencies
+    
+    def _parse_cargo_toml(self, file_path):
+        """解析 Cargo.toml 或 Cargo.lock 文件"""
+        dependencies = []
+        
+        try:
+            if file_path.endswith('.lock'):
+                # 解析 Cargo.lock
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # 查找所有 [[package]] 块
+                for package_match in re.finditer(r'\[\[package\]\](.*?)(?=\[\[package\]\]|\Z)', content, re.DOTALL):
+                    package_content = package_match.group(1)
+                    
+                    # 提取包名称
+                    name_match = re.search(r'name\s*=\s*"([^"]+)"', package_content)
+                    if not name_match:
+                        continue
+                    
+                    name = name_match.group(1)
+                    
+                    # 提取版本信息
+                    version_match = re.search(r'version\s*=\s*"([^"]+)"', package_content)
+                    version = version_match.group(1) if version_match else "NOASSERTION"
+                    
+                    # 提取源信息
+                    source_match = re.search(r'source\s*=\s*"([^"]+)"', package_content)
+                    source = source_match.group(1) if source_match else None
+                    
+                    download_url = source if source else f"https://crates.io/crates/{name}"
+                    
+                    dependencies.append({
+                        "name": name,
+                        "SPDXID": f"SPDXRef-Package-{name}",
+                        "versionInfo": version,
+                        "downloadLocation": download_url,
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: crates.io"
+                    })
+            else:
+                # 解析 Cargo.toml
+                # 尝试使用toml库解析
+                if toml:
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = toml.load(f)
+                        
+                        # 处理依赖部分
+                        if 'dependencies' in data and isinstance(data['dependencies'], dict):
+                            for name, info in data['dependencies'].items():
+                                # 处理不同格式的版本信息
+                                if isinstance(info, str):
+                                    version = info
+                                elif isinstance(info, dict) and 'version' in info:
+                                    version = info['version']
+                                else:
+                                    version = "NOASSERTION"
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{name}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://crates.io/crates/{name}",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: crates.io"
+                                })
+                        
+                        # 处理开发依赖
+                        if 'dev-dependencies' in data and isinstance(data['dev-dependencies'], dict):
+                            for name, info in data['dev-dependencies'].items():
+                                # 处理不同格式的版本信息
+                                if isinstance(info, str):
+                                    version = info
+                                elif isinstance(info, dict) and 'version' in info:
+                                    version = info['version']
+                                else:
+                                    version = "NOASSERTION"
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{name}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://crates.io/crates/{name}",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: crates.io"
+                                })
+                    except Exception as e:
+                        logger.warning(f"使用 toml 库解析 {file_path} 时出错: {e}，将尝试简单解析方式")
+                
+                # 如果toml库不可用或解析失败，使用正则表达式进行简单解析
+                if not dependencies:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    # 查找依赖部分
+                    dep_section_match = re.search(r'\[dependencies\](.*?)(?=\[|\Z)', content, re.DOTALL)
+                    if dep_section_match:
+                        dep_section = dep_section_match.group(1)
+                        
+                        # 解析每个依赖项
+                        for line in dep_section.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+                                
+                            # 匹配 "name = ..." 格式
+                            dep_match = re.match(r'([^\s=]+)\s*=\s*(.+)', line)
+                            if dep_match:
+                                name = dep_match.group(1)
+                                version_info = dep_match.group(2).strip()
+                                
+                                # 处理不同的版本声明格式
+                                if version_info.startswith('"') and version_info.endswith('"'):
+                                    # 简单的字符串版本
+                                    version = version_info.strip('"')
+                                elif version_info.startswith('{') and version_info.endswith('}'):
+                                    # 表格格式
+                                    version_match = re.search(r'version\s*=\s*"([^"]+)"', version_info)
+                                    version = version_match.group(1) if version_match else "NOASSERTION"
+                                else:
+                                    version = version_info
+                                
+                                dependencies.append({
+                                    "name": name,
+                                    "SPDXID": f"SPDXRef-Package-{name}",
+                                    "versionInfo": version,
+                                    "downloadLocation": f"https://crates.io/crates/{name}",
+                                    "licenseConcluded": "NOASSERTION",
+                                    "licenseDeclared": "NOASSERTION",
+                                    "copyrightText": "NOASSERTION",
+                                    "supplier": "Organization: crates.io"
+                                })
+        except Exception as e:
+            logger.warning(f"解析 Cargo.toml/lock 文件 {file_path} 时出错: {e}")
+        
+        return dependencies
+        
+    def _parse_pubspec_yaml(self, file_path):
+        """解析 pubspec.yaml 文件"""
+        dependencies = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            
+            # 解析依赖部分
+            if 'dependencies' in data and isinstance(data['dependencies'], dict):
+                for name, info in data['dependencies'].items():
+                    # 跳过SDK依赖
+                    if name == 'flutter' or name == 'dart':
+                        continue
+                    
+                    # 处理不同格式的版本信息
+                    if isinstance(info, str):
+                        version = info
+                    elif isinstance(info, dict) and 'version' in info:
+                        version = info['version']
+                    else:
+                        version = "NOASSERTION"
+                    
+                    dependencies.append({
+                        "name": name,
+                        "SPDXID": f"SPDXRef-Package-{name}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://pub.dev/packages/{name}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: pub.dev"
+                    })
+            
+            # 解析开发依赖
+            if 'dev_dependencies' in data and isinstance(data['dev_dependencies'], dict):
+                for name, info in data['dev_dependencies'].items():
+                    # 处理不同格式的版本信息
+                    if isinstance(info, str):
+                        version = info
+                    elif isinstance(info, dict) and 'version' in info:
+                        version = info['version']
+                    else:
+                        version = "NOASSERTION"
+                    
+                    dependencies.append({
+                        "name": name,
+                        "SPDXID": f"SPDXRef-Package-{name}",
+                        "versionInfo": version,
+                        "downloadLocation": f"https://pub.dev/packages/{name}",
+                        "licenseConcluded": "NOASSERTION",
+                        "licenseDeclared": "NOASSERTION",
+                        "copyrightText": "NOASSERTION",
+                        "supplier": "Organization: pub.dev"
+                    })
+        except Exception as e:
+            logger.warning(f"解析 pubspec.yaml 文件 {file_path} 时出错: {e}")
+        
+        return dependencies 
+
+    def _parse_yarn_lock(self, file_path):
+        """解析 yarn.lock 文件"""
+        dependencies = []
+        file_basename = os.path.basename(file_path)
+        logger.info(f"开始解析 {file_basename}")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # yarn.lock格式解析
+            # 每个包依赖项的格式通常是：
+            # "package-name@^1.0.0", "package-name@~1.0.0", "package-name@1.0.0":
+            #   version "1.0.2"
+            #   resolved "https://registry.yarnpkg.com/package-name/-/package-name-1.0.2.tgz#..."
+            #   integrity sha1-...
+            #   dependencies:
+            #     dependency-name "^2.0.0"
+            
+            # 使用正则表达式匹配依赖项
+            dep_pattern = re.compile(r'"?([^"@]+)(?:@[^"]*)"?(?:,\s*"[^"]+")*:\n\s+version\s+"([^"]+)"\n\s+resolved\s+"([^"]+)"', re.MULTILINE)
+            matches = dep_pattern.finditer(content)
+            
+            processed_packages = set()  # 用于跟踪已处理的包名+版本组合
+            
+            for match in matches:
+                package_name = match.group(1).strip()
+                version = match.group(2).strip()
+                resolved_url = match.group(3).strip()
+                
+                # 确保我们只添加每个包的一个版本
+                package_key = f"{package_name}|{version}"
+                if package_key in processed_packages:
+                    continue
+                
+                processed_packages.add(package_key)
+                
+                # 创建依赖项，使用唯一ID以避免重复
+                unique_id = hashlib.md5(f"{package_name}|{version}".encode()).hexdigest()
+                
+                dependency = {
+                    "name": package_name,
+                    "SPDXID": f"SPDXRef-Package-{unique_id}",
+                    "versionInfo": version,
+                    "downloadLocation": resolved_url,
+                    "licenseConcluded": "NOASSERTION",
+                    "licenseDeclared": "NOASSERTION",
+                    "copyrightText": "NOASSERTION",
+                    "supplier": "Organization: npm",
+                    "comment": f"From {file_basename}"
+                }
+                
+                dependencies.append(dependency)
+            
+            # 备用解析方法（如果上述方法没有找到依赖项）
+            if not dependencies:
+                logger.info(f"使用备用方法解析 {file_basename}")
+                # 简单的包名匹配
+                simple_dep_pattern = re.compile(r'"?([^"@\s]+)@[^:]+"?:')
+                version_pattern = re.compile(r'version "([^"]+)"')
+                resolved_pattern = re.compile(r'resolved "([^"]+)"')
+                
+                lines = content.split('\n')
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    
+                    # 查找包声明行
+                    package_match = simple_dep_pattern.search(line)
+                    if package_match:
+                        package_name = package_match.group(1).strip()
+                        
+                        # 查找版本和resolved URL
+                        version = "NOASSERTION"
+                        resolved_url = f"https://www.npmjs.com/package/{package_name}"
+                        
+                        # 查找接下来几行中的版本和URL
+                        for j in range(1, min(5, len(lines) - i)):
+                            next_line = lines[i + j]
+                            
+                            version_match = version_pattern.search(next_line)
+                            if version_match:
+                                version = version_match.group(1).strip()
+                            
+                            resolved_match = resolved_pattern.search(next_line)
+                            if resolved_match:
+                                resolved_url = resolved_match.group(1).strip()
+                        
+                        # 创建依赖项，使用唯一ID以避免重复
+                        package_key = f"{package_name}|{version}"
+                        if package_key not in processed_packages:
+                            processed_packages.add(package_key)
+                            
+                            unique_id = hashlib.md5(f"{package_name}|{version}".encode()).hexdigest()
+                            
+                            dependency = {
+                                "name": package_name,
+                                "SPDXID": f"SPDXRef-Package-{unique_id}",
+                                "versionInfo": version,
+                                "downloadLocation": resolved_url,
+                                "licenseConcluded": "NOASSERTION",
+                                "licenseDeclared": "NOASSERTION",
+                                "copyrightText": "NOASSERTION",
+                                "supplier": "Organization: npm",
+                                "comment": f"From {file_basename} (备用解析)"
+                            }
+                            
+                            dependencies.append(dependency)
+                    
+                    i += 1
+            
+            logger.info(f"从 {file_basename} 中解析了 {len(dependencies)} 个依赖项")
+            
+        except Exception as e:
+            logger.warning(f"解析 yarn.lock 文件 {file_path} 时出错: {e}")
+            logger.debug(f"详细错误: {traceback.format_exc()}")
+        
+        return dependencies

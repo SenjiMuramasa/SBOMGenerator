@@ -163,15 +163,40 @@ def get_package_manager_files(repo_dir):
     """
     # 包管理器文件和对应的正则表达式模式
     package_manager_patterns = [
-        ('Python', re.compile(r'(requirements\.txt|setup\.py|Pipfile|pyproject\.toml)$')),
-        ('JavaScript/Node.js', re.compile(r'(package\.json)$')),
-        ('Java', re.compile(r'(pom\.xml|build\.gradle|build\.gradle\.kts)$')),
-        ('Go', re.compile(r'(go\.mod)$')),
-        ('Ruby', re.compile(r'(Gemfile|gemspec)$')),
-        ('PHP', re.compile(r'(composer\.json)$')),
-        ('Rust', re.compile(r'(Cargo\.toml)$')),
-        ('C#', re.compile(r'(\.csproj|packages\.config|paket\.dependencies)$')),
-        ('Swift', re.compile(r'(Package\.swift)$')),
+        # Python: 匹配标准包管理文件和以"requirements"开头的txt文件
+        ('Python', re.compile(r'(requirements.*\.txt|setup\.py|Pipfile|pyproject\.toml)$')),
+        # JavaScript/Node.js: 匹配标准包管理文件和锁文件
+        ('JavaScript/Node.js', re.compile(r'(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock)$')),
+        # Java: 匹配Maven和Gradle文件
+        ('Java', re.compile(r'(pom\.xml|build\.gradle|build\.gradle\.kts|gradle\.properties|settings\.gradle|ivy\.xml)$')),
+        # Go: 匹配Go模块文件
+        ('Go', re.compile(r'(go\.mod|go\.sum)$')),
+        # Ruby: 匹配Ruby包管理文件
+        ('Ruby', re.compile(r'(Gemfile|Gemfile\.lock|.*\.gemspec)$')),
+        # PHP: 匹配Composer文件
+        ('PHP', re.compile(r'(composer\.json|composer\.lock)$')),
+        # Rust: 匹配Cargo文件
+        ('Rust', re.compile(r'(Cargo\.toml|Cargo\.lock)$')),
+        # C#: 匹配.NET包管理文件
+        ('C#', re.compile(r'(\.csproj|\.sln|packages\.config|paket\.dependencies|paket\.lock|nuget\.config)$')),
+        # Swift: 匹配Swift包管理文件
+        ('Swift', re.compile(r'(Package\.swift|Package\.resolved)$')),
+        # Dart/Flutter: 匹配pub包管理文件
+        ('Dart/Flutter', re.compile(r'(pubspec\.yaml|pubspec\.lock)$')),
+    ]
+    
+    # 自定义检查函数，用于识别特定模式的文件名
+    custom_file_checks = [
+        # Python: 以requirements开头的txt文件
+        (lambda f: f.lower().startswith('requirements') and f.lower().endswith('.txt'), 'Python'),
+        # JavaScript: 以package开头的json文件
+        (lambda f: f.lower().startswith('package') and f.lower().endswith('.json'), 'JavaScript/Node.js'),
+        # Java: 以build开头的gradle文件
+        (lambda f: f.lower().startswith('build') and f.lower().endswith('.gradle'), 'Java'),
+        # C#: 以.开头的csproj或sln文件
+        (lambda f: f.lower().endswith('.csproj') or f.lower().endswith('.sln'), 'C#'),
+        # Ruby: 以.gemspec结尾的文件
+        (lambda f: f.lower().endswith('.gemspec'), 'Ruby'),
     ]
     
     # 查找匹配的文件
@@ -194,6 +219,18 @@ def get_package_manager_files(repo_dir):
                     except:
                         continue
                     
+                    # 应用自定义检查函数
+                    file_matched = False
+                    for check_func, manager in custom_file_checks:
+                        if check_func(file):
+                            package_manager_files.append((manager, rel_path))
+                            file_matched = True
+                            break
+                    
+                    if file_matched:
+                        continue
+                    
+                    # 使用正则表达式检查其他包管理文件
                     for manager, pattern in package_manager_patterns:
                         if pattern.search(file):
                             package_manager_files.append((manager, rel_path))
