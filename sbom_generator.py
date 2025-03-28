@@ -48,7 +48,8 @@ def load_config():
 @click.option('--repo', '-r', help='GitHub repository name')
 @click.option('--output', '-f', help='Output file path (default: output/<repo>-sbom.spdx.json)')
 @click.option('--verbose', '-v', is_flag=True, help='Enable verbose output')
-def main(org, repo, output, verbose):
+@click.option('--commit', '-c', help='Specific commit hash to generate SBOM for')
+def main(org, repo, output, verbose, commit):
     """Generate SBOM for a GitHub repository in SPDX-2.3 format"""
     # Setup logging level
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -83,14 +84,14 @@ def main(org, repo, output, verbose):
         output = os.path.join(output_dir, output)
     
     # Initialize GitHub client
-    github_token = config['github']['token']
-    if github_token == "your-github-token-here":
+    github_token = config.get('github', {}).get('token')
+    if not github_token or github_token == "your-github-token-here":
         logger.warning("GitHub token not configured. Some repositories may not be accessible.")
         print("Warning: GitHub token not configured in config.yaml")
         github_token = click.prompt("Enter GitHub token (leave empty to continue without token)", 
                                    default="", show_default=False)
     
-    github_client = GitHubClient(github_token, config['github']['rate_limit_wait'])
+    github_client = GitHubClient(github_token, config.get('github', {}).get('rate_limit_wait', True))
     
     # Initialize SBOM generator
     sbom_generator = SBOMGenerator(
@@ -104,8 +105,8 @@ def main(org, repo, output, verbose):
     
     try:
         # Generate SBOM
-        print(f"Generating SBOM for {org}/{repo}...")
-        sbom_file = sbom_generator.generate_sbom(org, repo, output)
+        print(f"Generating SBOM for {org}/{repo}" + (f" at commit {commit}" if commit else "..."))
+        sbom_file = sbom_generator.generate_sbom(org, repo, output, commit)
         print(f"SBOM generated successfully: {sbom_file}")
         print(f"SBOM file saved at: {os.path.abspath(sbom_file)}")
     except Exception as e:

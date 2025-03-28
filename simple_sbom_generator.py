@@ -31,6 +31,7 @@ def parse_arguments():
     github_group.add_argument('--org', '-o', help='GitHub组织/用户名')
     github_group.add_argument('--repo', '-r', help='GitHub仓库名')
     github_group.add_argument('--token', '-t', help='GitHub个人访问令牌')
+    github_group.add_argument('--commit', '-ct', help='GitHub仓库Commit')
     
     # 本地项目相关参数
     local_group = parser.add_argument_group('本地项目选项')
@@ -122,7 +123,7 @@ def main():
             
             # 生成SBOM
             logger.info(f"开始为 {args.org}/{args.repo} 生成SBOM")
-            output_path = generator.generate_sbom(args.org, args.repo, str(output_file))
+            output_path = generator.generate_sbom(args.org, args.repo, str(output_file), args.commit)
             
         elif args.local:
             # 本地项目模式

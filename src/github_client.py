@@ -147,7 +147,7 @@ class GitHubClient:
             logger.error(f"获取仓库元数据时出错: {e}")
             raise
     
-    def download_repository(self, org, repo, output_dir, branch=None):
+    def download_repository(self, org, repo, output_dir, branch=None, commit=None):
         """
         下载 GitHub 仓库
         
@@ -156,6 +156,7 @@ class GitHubClient:
             repo (str): 仓库名称
             output_dir (str): 输出目录路径
             branch (str, optional): 要下载的分支
+            commit (str, optional): 要下载的版本
             
         Returns:
             str: 下载的仓库本地路径
@@ -168,12 +169,12 @@ class GitHubClient:
         
         # 如果有令牌，使用 Git 克隆
         if self.token:
-            return self._clone_repository(org, repo, repo_path, branch)
+            return self._clone_repository(org, repo, repo_path, branch, commit)
         else:
             # 否则使用 ZIP 下载
-            return self._download_repository_zip(org, repo, repo_path, branch)
+            return self._download_repository_zip(org, repo, repo_path, branch, commit)
     
-    def _clone_repository(self, org, repo, repo_path, branch=None):
+    def _clone_repository(self, org, repo, repo_path, branch=None, commit=None):
         """
         使用 Git 克隆仓库
         
@@ -182,6 +183,7 @@ class GitHubClient:
             repo (str): 仓库名称
             repo_path (str): 本地仓库路径
             branch (str, optional): 要克隆的分支
+            commit (str, optional): 要克隆的特定commit hash
             
         Returns:
             str: 克隆的仓库本地路径
@@ -194,15 +196,30 @@ class GitHubClient:
             # 创建 Git URL
             git_url = f"https://{self.token}@github.com/{org}/{repo}.git"
             
-            logger.info(f"正在克隆仓库 {org}/{repo}")
+            logger.info(f"正在克隆仓库 {org}/{repo}" + (f"（分支：{branch}）" if branch else "") + (f"（commit：{commit}）" if commit else ""))
             
-            # 克隆仓库
-            clone_args = ['--depth', '1']  # 浅克隆以减少数据传输
+            # 如果指定了commit，不使用浅克隆，以确保能够获取到特定的commit
+            if commit:
+                logger.info(f"由于指定了commit {commit}，将进行完整克隆以确保能获取到该commit")
+                Repo.clone_from(git_url, repo_path, branch=branch if branch else None)
+            else:
+                # 否则使用浅克隆以提高性能
+                Repo.clone_from(git_url, repo_path, depth=1, branch=branch if branch else None)
             
-            if branch:
-                clone_args.extend(['--branch', branch])
-            
-            Repo.clone_from(git_url, repo_path, depth=1, branch=branch)
+            # 如果指定了commit，切换到该commit
+            if commit:
+                git_repo = Repo(repo_path)
+                try:
+                    # 尝试直接切换到commit
+                    git_repo.git.checkout(commit)
+                    logger.info(f"已切换到指定的commit: {commit}")
+                except GitCommandError as e:
+                    # 如果切换失败，尝试获取更多历史记录然后再切换
+                    logger.warning(f"无法直接切换到commit {commit}，尝试获取更多历史记录...")
+                    git_repo.git.fetch('--unshallow', _ok_code=[0, 1, 128])  # 128是"无需取消浅克隆"的错误码
+                    git_repo.git.fetch('origin', f'+{commit}:refs/remotes/origin/{commit}', _ok_code=[0, 1, 128])
+                    git_repo.git.checkout(commit)
+                    logger.info(f"在获取更多历史后，成功切换到指定的commit: {commit}")
             
             logger.info(f"成功克隆仓库到 {repo_path}")
             return repo_path
@@ -211,7 +228,7 @@ class GitHubClient:
             logger.error(f"克隆仓库时出错: {e}")
             raise
     
-    def _download_repository_zip(self, org, repo, repo_path, branch=None):
+    def _download_repository_zip(self, org, repo, repo_path, branch=None, commit=None):
         """
         下载仓库的 ZIP 归档
         
@@ -220,6 +237,7 @@ class GitHubClient:
             repo (str): 仓库名称
             repo_path (str): 本地仓库路径
             branch (str, optional): 要下载的分支
+            commit (str, optional): 要下载的特定commit hash
             
         Returns:
             str: 解压的仓库本地路径
@@ -233,8 +251,11 @@ class GitHubClient:
             with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as temp_zip:
                 temp_zip_path = temp_zip.name
             
-            # 确定分支
-            ref = branch if branch else "HEAD"
+            # 确定引用
+            # 如果提供了commit，则使用commit
+            # 如果提供了branch，则使用branch
+            # 否则使用默认的HEAD
+            ref = commit if commit else (branch if branch else "HEAD")
             
             # 构建 ZIP URL
             zip_url = f"https://github.com/{org}/{repo}/archive/{ref}.zip"
@@ -244,16 +265,24 @@ class GitHubClient:
             if self.token:
                 download_headers["Authorization"] = f"Bearer {self.token}"
             
-            logger.info(f"正在下载仓库 ZIP 归档: {org}/{repo}")
+            logger.info(f"正在下载仓库 ZIP 归档: {org}/{repo}" + (f"（分支：{branch}）" if branch and not commit else "") + (f"（commit：{commit}）" if commit else ""))
             
-            # 下载 ZIP 文件
-            response = requests.get(zip_url, headers=download_headers, stream=True)
-            response.raise_for_status()
-            
-            # 写入 ZIP 文件
-            with open(temp_zip_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+            try:
+                # 下载 ZIP 文件
+                response = requests.get(zip_url, headers=download_headers, stream=True)
+                response.raise_for_status()
+                
+                # 写入 ZIP 文件
+                with open(temp_zip_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+            except requests.exceptions.HTTPError as e:
+                # 如果是不存在的commit引起的404错误，提供更清晰的错误信息
+                if e.response.status_code == 404 and commit:
+                    error_msg = f"无法下载commit '{commit}'的代码，该commit可能不存在或无权访问。请确认commit hash是否正确。"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg) from e
+                raise
             
             # 解压 ZIP 文件
             with zipfile.ZipFile(temp_zip_path, 'r') as zip_ref:

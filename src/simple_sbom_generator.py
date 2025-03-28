@@ -96,7 +96,7 @@ class SimpleSBOMGenerator:
         self.exclude_dirs = ['.git', 'node_modules', '__pycache__', 'dist', 'build', 'target', '.idea', '.vscode']
         logger.info("简化版 SBOM 生成器已初始化")
     
-    def generate_sbom(self, org, repo, output_file):
+    def generate_sbom(self, org, repo, output_file, commit=None):
         """
         为 GitHub 仓库生成 SBOM
         
@@ -104,6 +104,7 @@ class SimpleSBOMGenerator:
             org (str): 组织名称
             repo (str): 仓库名称
             output_file (str): 输出文件路径
+            commit (str, optional): 特定的commit hash，如果提供则获取该版本的SBOM
             
         Returns:
             str: 生成的 SBOM 文件路径
@@ -113,9 +114,9 @@ class SimpleSBOMGenerator:
             self.repo_temp_dir = create_repo_temp_dir(self.temp_dir, org, repo)
             logger.info(f"为仓库创建了临时目录: {self.repo_temp_dir}")
             
-            # 下载仓库
-            repo_dir = self.github_client.download_repository(org, repo, self.repo_temp_dir)
-            logger.info(f"下载仓库到 {repo_dir}")
+            # 下载仓库，正确传递commit参数
+            repo_dir = self.github_client.download_repository(org, repo, self.repo_temp_dir, None, commit)
+            logger.info(f"下载仓库到 {repo_dir}" + (f" (commit: {commit})" if commit else ""))
             
             # 获取仓库元数据
             metadata = self.github_client.get_repository_metadata(org, repo)
