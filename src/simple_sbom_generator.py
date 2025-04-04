@@ -347,23 +347,11 @@ class SimpleSBOMGenerator:
         
         logger.info(f"收集了 {len(files)} 个文件的信息")
         
-        # 解析依赖项
-        packages = [
-            {
-                "name": metadata["name"],
-                "SPDXID": f"SPDXRef-Package-{metadata['name']}",
-                "downloadLocation": metadata["clone_url"],
-                "filesAnalyzed": True,
-                "licenseConcluded": "NOASSERTION",
-                "licenseDeclared": metadata["license"] if metadata["license"] else "NOASSERTION",
-                "copyrightText": "NOASSERTION",
-                "description": metadata["description"] or "No description provided",
-                "comment": f"Primary languages: {', '.join(languages.keys()) if languages else 'Unknown'}",
-                "versionInfo": f"commit-{metadata['default_branch']}",
-                "supplier": f"Organization: {org}",
-                "homepage": metadata["html_url"]
-            }
-        ]
+        # 创建项目信息（只用于关系标识，不添加到packages列表中）
+        project_spdxid = f"SPDXRef-Package-{metadata['name']}"
+        
+        # 仅初始化依赖项列表（不包含主项目）
+        packages = []
         
         # 添加依赖关系信息
         dependencies = []
@@ -387,14 +375,13 @@ class SimpleSBOMGenerator:
                     if extracted_deps:
                         # 使用精确的去重逻辑
                         added_from_file = 0
-                        
                         for dep in extracted_deps:
-                            dep_name = dep['name']
-                            version_info = dep['versionInfo']
+                            dep_name = dep.get('name', '')
+                            version_info = dep.get('versionInfo', '')
+                            condition = dep.get('condition', '')
                             
-                            # 创建唯一键: 包名+版本号
-                            # 对于条件依赖，会将条件也包含在内，使不同条件的同名包被视为不同的依赖项
-                            key = f"{dep_name}|{version_info}"
+                            # 创建唯一标识符
+                            key = f"{dep_name}|{version_info}|{condition}"
                             
                             if key not in dep_keys:
                                 dependencies.append(dep)
@@ -431,7 +418,13 @@ class SimpleSBOMGenerator:
             "spdxVersion": "SPDX-2.3",
             "dataLicense": "CC0-1.0",
             "SPDXID": "SPDXRef-DOCUMENT",
-            "name": f"{org}/{repo} SBOM",
+            "name": f"{org}/{repo}",
+            # 添加项目描述信息
+            "comment": metadata["description"] or "No description provided",
+            # 如果有许可证信息，添加到文档中
+            "licenseDeclared": metadata["license"] if metadata["license"] else "NOASSERTION",
+            # 添加项目语言信息
+            "primaryLanguage": ", ".join(languages.keys()) if languages else "Unknown",
             "documentNamespace": doc_namespace,
             "creationInfo": {
                 "created": timestamp,
@@ -441,21 +434,22 @@ class SimpleSBOMGenerator:
                 ],
                 "licenseListVersion": "3.19"
             },
+            # 仅包含依赖项
             "packages": packages,
             "files": files,
             "relationships": [
                 {
                     "spdxElementId": "SPDXRef-DOCUMENT",
-                    "relatedSpdxElement": f"SPDXRef-Package-{metadata['name']}",
+                    "relatedSpdxElement": project_spdxid,
                     "relationshipType": "DESCRIBES"
                 }
             ]
         }
         
-        # 添加包之间的关系
+        # 添加项目与其依赖项的关系
         for dep in dependencies:
             sbom_document["relationships"].append({
-                "spdxElementId": f"SPDXRef-Package-{metadata['name']}",
+                "spdxElementId": project_spdxid,
                 "relatedSpdxElement": dep["SPDXID"],
                 "relationshipType": "DEPENDS_ON"
             })

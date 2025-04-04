@@ -106,7 +106,10 @@ def main():
             else:
                 output_dir = Path('output')
                 output_dir.mkdir(exist_ok=True)
-                output_file = output_dir / f"{args.org}_{args.repo}_sbom.{args.format}"
+                if args.commit:
+                    output_file = output_dir / f"{args.org}_{args.repo}_{args.commit}.{args.format}"
+                else:
+                    output_file = output_dir / f"{args.org}_{args.repo}.{args.format}"
             
             # 初始化GitHub客户端
             github_client = GitHubClient(github_token)
